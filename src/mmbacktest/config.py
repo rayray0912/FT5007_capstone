@@ -76,9 +76,16 @@ class CalibrationConfig:
     rolling window at the decision frequency.
     """
 
-    # Intensity estimation
+    # Intensity estimation.
+    #
+    # max_delta_bps must match the instrument's spread scale. BTC-PERP at
+    # ~111,000 quotes a spread of roughly 0.5-1.0 USD, i.e. under 0.1 bps, and
+    # aggressive flow rarely reaches more than a few USD past the mid. A
+    # 20 bps window -- reasonable for an equity -- is 222 USD here, so every
+    # trade lands in the first bucket and the fit has no slope to find. This
+    # was caught by the fit reporting a single usable bucket.
     intensity_n_buckets: int = 12
-    intensity_max_delta_bps: float = 20.0
+    intensity_max_delta_bps: float = 1.0
     intensity_min_samples_per_bucket: int = 30
 
     # Volatility estimation
@@ -113,14 +120,35 @@ class StrategyConfig:
     gamma: float = 0.1                # inventory risk aversion
     q_max: float = 10.0               # inventory bound, in contracts
     order_size: float = 1.0           # size per quote, in contracts
-    horizon_seconds: float = 3600.0   # T - t for finite-horizon formulations
+    # T - t for the finite-horizon formulations (AS only; GLFT's asymptotic
+    # form has no horizon term).
+    #
+    # This parameter does more work than it looks like it does. AS's risk term
+    # is gamma * sigma^2 * (T - t), so with sigma in price units per sqrt(s),
+    # a one-hour horizon on BTC-PERP gives 0.1 * 0.1225 * 3600 = 44 USD of
+    # half-spread against a market spread near 1 USD: AS quotes 25x outside
+    # the touch and never trades. Setting it to the trading session length is
+    # the intuitive choice and it is wrong.
+    #
+    # The defensible reading of T - t for a continuously running maker is the
+    # horizon over which inventory is expected to be worked off, not the
+    # length of the session. At observed fill rates that is on the order of a
+    # minute, so that is the default. The sensitivity of results to this
+    # choice belongs in the report rather than being buried here.
+    horizon_seconds: float = 60.0
 
-    # Symmetric baseline only
-    fixed_half_spread_bps: float = 2.0
+    # Symmetric baseline only.
+    #
+    # Scale note, same issue as the intensity window: on BTC-PERP a 2 bps
+    # half-spread is 22 USD against a market spread near 1 USD, which quotes
+    # so far outside the touch that nothing ever fills. The defaults below are
+    # sized for crypto perpetuals; an equity book would want roughly two
+    # orders of magnitude more.
+    fixed_half_spread_bps: float = 0.05
 
     # Quote hygiene, applies to every quoter
-    min_half_spread_bps: float = 0.1
-    max_half_spread_bps: float = 100.0
+    min_half_spread_bps: float = 0.002   # ~2 USD on BTC, about 4 ticks
+    max_half_spread_bps: float = 5.0
     tick_size: float = 0.5            # BTC-PERP on Bitfinex quotes in 0.5 USD
 
 

@@ -14,7 +14,7 @@ data:
 
 calibration:
   intensity_n_buckets: 12
-  intensity_max_delta_bps: 20.0
+  intensity_max_delta_bps: 1.0
   vol_window_seconds: 300.0
   stratify_by_session: true
 
@@ -23,7 +23,7 @@ strategy:
   gamma: 0.1
   q_max: 10.0
   order_size: 1.0
-  horizon_seconds: 3600.0
+  horizon_seconds: 60.0
   tick_size: 0.5
 
 simulation:
