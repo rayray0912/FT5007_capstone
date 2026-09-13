@@ -232,3 +232,35 @@ pooled fit describes neither regime.
 3. **AS horizon parameter** — is treating T−t as the inventory-holding horizon
    rather than the session length the right call, and should the sensitivity to
    it be reported as a result in its own right?
+
+---
+
+## Appendix: fee sensitivity, synthetic data
+
+Run with `--fees 0,8,-1` on 40,000 synthetic events. PnL levels are not
+meaningful here, but the *relative* effect of the fee tier is, because it is
+arithmetic on the traded notional rather than a property of the generator.
+
+| fee tier | symmetric | avellaneda_stoikov | glft |
+|---|---|---|---|
+| zero | +95.64 | +144.40 | +41.84 |
+| standard maker, 8 bp | −11,287 | −3,854 | −629 |
+| MM rebate, −1 bp | +1,518 | +644 | +126 |
+
+The magnitude of the 8 bp column is the point. BTC-PERP quotes a spread near
+1 USD on a 111,000 mid, which is roughly **0.09 bps**. A standard maker fee of
+8 bps is therefore about ninety times the entire spread being competed for. No
+amount of quoting skill recovers that: at the standard tier, passive market
+making on this instrument is arithmetically unprofitable before any question of
+adverse selection arises.
+
+Two consequences for the research design:
+
+1. **The MM rebate tier is not a convenience assumption, it is the only regime
+   in which the strategy exists at all.** That needs stating explicitly in any
+   write-up rather than appearing as a footnote, because a reader who assumes
+   standard fees will correctly conclude the whole thing is unprofitable.
+2. **Strategies that trade less are less exposed to the fee term.** GLFT loses
+   least at 8 bp purely because it fills least. Any comparison across fee
+   regimes has to account for this, or it will read fee exposure as strategy
+   quality.
