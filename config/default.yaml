@@ -1,0 +1,35 @@
+# Default run configuration.
+# Override on the command line: --symbol tETHF0:USTF0 --maker-fee-bps -1.0
+
+clickhouse:
+  host: 100.76.49.84
+  port: 8123
+  database: bfx
+
+data:
+  symbol: "tBTCF0:USTF0"
+  epoch: null               # null -> longest available epoch
+  min_epoch_minutes: 120.0
+  book_levels: 25
+
+calibration:
+  intensity_n_buckets: 12
+  intensity_max_delta_bps: 20.0
+  vol_window_seconds: 300.0
+  stratify_by_session: true
+
+strategy:
+  name: glft
+  gamma: 0.1
+  q_max: 10.0
+  order_size: 1.0
+  horizon_seconds: 3600.0
+  tick_size: 0.5
+
+simulation:
+  decision_interval_ms: 100
+  maker_fee_bps: 0.0
+  use_queue_model: true
+  quote_latency_ms: 80.0
+
+seed: 20260913
