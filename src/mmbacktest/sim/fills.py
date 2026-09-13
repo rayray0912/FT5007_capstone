@@ -312,6 +312,11 @@ def compute_markouts(
 
     Sign convention: a positive markout is favourable to us. For a buy that
     means the mid rose after we bought.
+
+    Returns the full fill frame with markout columns appended, rather than a
+    narrow projection. Downstream metrics need the other fill fields
+    (queue wait, signed size) on the same frame, and rebuilding a subset here
+    silently drops them.
     """
     if not fills or mid_series.empty:
         return pd.DataFrame()
@@ -322,7 +327,10 @@ def compute_markouts(
             "price": f.price,
             "size": f.size,
             "is_buy": f.is_buy,
+            "signed_size": f.signed_size,
+            "order_id": f.order_id,
             "mid_at_fill": f.mid_at_fill,
+            "queue_wait_seconds": f.queue_wait_seconds,
         }
         for f in fills
     ]).sort_values("ts").reset_index(drop=True)
