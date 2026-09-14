@@ -4,8 +4,9 @@ Market-making backtest framework built on order-level (MBO) data from Bitfinex
 perpetual swaps. Implements a Guéant–Lehalle–Fernandez-Tapia (GLFT) quoter and
 evaluates it against classical baselines on a shared simulator.
 
-**Status:** baselines implemented and running; LLM-adaptive layer not yet built.
-See [`docs/progress_report.md`](docs/progress_report.md).
+**Status:** baselines implemented and running against the real dataset;
+LLM-adaptive layer not yet built. No performance figure is being reported yet —
+see [`docs/progress_report.md`](docs/progress_report.md) for why.
 
 ---
 
@@ -108,6 +109,28 @@ out to be load-bearing rather than cosmetic — see the progress report.
 case, the standard maker rate, and the market-maker rebate tier in one pass.
 Reporting a single fee level is how a strategy ends up looking profitable at
 one tier and not at another.
+
+**The tick is a function of price, not a constant.** Bitfinex quotes to five
+significant digits, so the increment is 1.0 for BTC at 76–80k, 0.1 for ETH at
+2,470, and it steps by a decade when price crosses a power of ten. Quoting off
+that grid is not a rounding nuisance: the reconstructed book can have no depth
+at a price the venue cannot represent, so a queue-position model reads it as an
+empty queue and fills instantly. Every quote is asserted onto the grid.
+
+**Inventory PnL is reported with its own noise level.** A maker holding a
+position through a random walk earns and loses continuously, so the net is a
+small residual of two large sums and is mostly noise. The comparison table
+carries `inventory gross` and `inventory t-stat` alongside it, and the CLI
+refuses to let an inventory-dominated result pass without a warning when
+|t| < 2. This exists because a run once produced +40.62% annualised of which
+68% was a residual with t = 0.32.
+
+**Fills on levels we created are counted separately.** Stepping inside a 15 USD
+spread is what a maker is for, and being alone at a new level legitimately
+means being first in the queue. But those fills never appear on the historical
+tape, so the PnL from them assumes our quote would not have changed the flow
+that traded against it — an assumption a replay cannot test. The share is
+reported (`fills at self-made level`) rather than assumed away.
 
 ## Known limitations
 
