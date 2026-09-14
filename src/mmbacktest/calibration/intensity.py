@@ -43,6 +43,19 @@ from ..config import CalibrationConfig
 logger = logging.getLogger(__name__)
 
 
+# Minimum number of populated distance buckets before a decay fit means
+# anything. Two parameters are being estimated (slope and intercept), so
+# three points leave one degree of freedom and R^2 is then near 1 almost
+# regardless of the data -- a fit on three buckets reported R^2 = 0.993 on a
+# window whose kappa was not identified at all. Four is the smallest number
+# at which R^2 carries information.
+#
+# This threshold is used in two places that previously disagreed: the fit
+# fell back at fewer than 3 buckets while is_usable required 4, so a 3-bucket
+# window produced a healthy-looking fit that was then silently rejected.
+MIN_BUCKETS_FOR_FIT = 4
+
+
 @dataclass
 class IntensityEstimate:
     """Fitted intensity parameters for one stratum."""
@@ -63,11 +76,53 @@ class IntensityEstimate:
         the exponential form is not describing this data well and any quote
         built on it is guesswork.
         """
-        return self.kappa > 1e-9 and self.r_squared >= 0.5 and self.n_buckets_used >= 4
+        return (
+            self.kappa > 1e-9
+            and self.r_squared >= 0.5
+            and self.n_buckets_used >= MIN_BUCKETS_FOR_FIT
+        )
+
+    @property
+    def arrival_intensity(self) -> float:
+        """GLFT's `A`: fills per second at a quote sitting on the mid, one side.
+
+        This is NOT the fitted `A`, and the difference is a factor of
+        1 / (2 * kappa) -- about 4.8x on BTC-PERP.
+
+        The fit estimates a *density*. It buckets trades by distance from the
+        mid and regresses the per-bucket rate, so `self.A` is arrivals per
+        second per unit of distance, pooled over both aggressor directions.
+
+        Gueant-Lehalle-Fernandez-Tapia define the intensity of the point
+        process that executes our quote: lambda(d) = A exp(-k d) is the rate
+        at which an order resting at distance d gets filled. An order at
+        distance d is executed by any trade printing at distance >= d,
+        because a marketable order consumes every level it crosses on the way
+        out. So the intensity at d is the density integrated outwards:
+
+            lambda(d) = int_d^inf A_density e^{-kappa u} du
+                      = (A_density / kappa) e^{-kappa d}
+
+        giving lambda(0) = A_density / kappa. The extra factor of two is the
+        aggressor direction: the density pools buy- and sell-initiated
+        trades, while a resting bid is only ever hit by sellers.
+
+        Feeding the raw density into GLFT understates A by ~4.8x. A sits
+        under a square root in the inventory coefficient, so the quote comes
+        out ~2.2x too wide -- enough on this instrument to hit the
+        max_half_spread clamp and stop the strategy trading at all.
+        """
+        return self.A / max(self.kappa, 1e-12) / 2.0
 
     def fill_rate(self, delta: float | np.ndarray) -> float | np.ndarray:
-        """lambda(delta), the expected fills per second at distance delta."""
-        return self.A * np.exp(-self.kappa * np.asarray(delta, dtype=float))
+        """lambda(delta), the expected fills per second at distance delta.
+
+        Uses the GLFT-convention intensity (see `arrival_intensity`), so this
+        is the rate at which a quote resting at `delta` is executed.
+        """
+        return self.arrival_intensity * np.exp(
+            -self.kappa * np.asarray(delta, dtype=float)
+        )
 
     def __str__(self) -> str:
         flag = "" if self.is_usable else "  [UNUSABLE]"
@@ -144,7 +199,7 @@ def estimate_intensity(
     rates = counts / duration_seconds
 
     keep = counts >= cfg.intensity_min_samples_per_bucket
-    if keep.sum() < 3:
+    if keep.sum() < MIN_BUCKETS_FOR_FIT:
         # Not enough resolved buckets to fit a slope. Fall back to a single
         # aggregate rate with no decay information, and mark it unusable via
         # kappa <= 0 so callers do not quote on it.

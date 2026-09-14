@@ -69,6 +69,14 @@ class RestingOrder:
     queue_ahead: float        # volume still in front of us at this level
     filled: float = 0.0
 
+    # Depth resting at our price the moment we placed. Zero means we created
+    # the level: legitimate (a maker stepping inside a wide spread really is
+    # alone and really is first in line) but it is also the case the replay
+    # models least well, because our presence cannot influence the historical
+    # flow that then trades against us. Kept so the share of PnL earned this
+    # way can be reported instead of assumed away. See `stats()`.
+    depth_at_placement: float = 0.0
+
     @property
     def remaining(self) -> float:
         return max(self.size - self.filled, 0.0)
@@ -119,6 +127,11 @@ class FillSimulator:
     n_filled: int = 0
     n_cancelled: int = 0
 
+    # Provenance of fills, for the diagnostic in `stats()`.
+    n_placed_at_new_level: int = 0
+    n_filled_at_new_level: int = 0
+    n_filled_from_queue: int = 0
+
     # ------------------------------------------------------------------
     # Order management
     # ------------------------------------------------------------------
@@ -154,7 +167,10 @@ class FillSimulator:
             placed_at=now,
             live_at=now + self.cfg.quote_latency_ms / 1000.0,
             queue_ahead=max(queue_ahead, 0.0) * self.cfg.queue_ahead_inflation,
+            depth_at_placement=max(queue_ahead, 0.0),
         )
+        if queue_ahead <= 0.0:
+            self.n_placed_at_new_level += 1
         return oid
 
     def cancel(self, order_id: int) -> None:
@@ -264,6 +280,10 @@ class FillSimulator:
             order.filled += fill_size
             remaining_volume -= fill_size
             self.n_filled += 1
+            if order.depth_at_placement <= 0.0:
+                self.n_filled_at_new_level += 1
+            else:
+                self.n_filled_from_queue += 1
 
             fills.append(
                 Fill(
@@ -288,12 +308,35 @@ class FillSimulator:
     # ------------------------------------------------------------------
 
     def stats(self) -> dict[str, float]:
+        """Execution counters, plus a provenance check on the fills.
+
+        `frac_fills_at_new_level` is the share of fills on levels we created
+        rather than joined. It is not an error metric -- stepping inside a
+        wide spread is what a maker is for, and on this instrument the touch
+        spread is a median 15 USD, so most sensible quotes will create a
+        level. It is reported because it bounds how far the result can be
+        trusted: a fill on a level we created is a fill the historical tape
+        never actually saw, so the higher this fraction, the more the PnL
+        rests on the assumption that our quote would not have changed the
+        flow that traded against it. A run that is near 1.0 is not
+        necessarily wrong, but its PnL is a statement about a
+        counterfactual book rather than about the observed one.
+        """
         return {
             "n_placed": self.n_placed,
             "n_filled": self.n_filled,
             "n_cancelled": self.n_cancelled,
             "n_open": self.n_open,
             "fill_ratio": self.n_filled / self.n_placed if self.n_placed else 0.0,
+            "n_placed_at_new_level": self.n_placed_at_new_level,
+            "n_filled_at_new_level": self.n_filled_at_new_level,
+            "n_filled_from_queue": self.n_filled_from_queue,
+            "frac_placed_at_new_level": (
+                self.n_placed_at_new_level / self.n_placed if self.n_placed else 0.0
+            ),
+            "frac_fills_at_new_level": (
+                self.n_filled_at_new_level / self.n_filled if self.n_filled else 0.0
+            ),
         }
 
 

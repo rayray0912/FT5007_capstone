@@ -83,6 +83,32 @@ class PerformanceMetrics:
     strategy: str = ""
     annualisation_is_reliable: bool = True
 
+    # Inventory PnL against the noise it is drawn from.
+    #
+    # `pnl_inventory` is a net figure: the sum of inventory * d_mid over every
+    # step. Both of its halves are large and nearly equal -- a maker holding a
+    # position through a random walk earns and loses continuously -- so the net
+    # is a small residual of two big numbers and is mostly noise. Reporting it
+    # without its scale invites reading a random residual as skill, which is
+    # exactly how a market-making backtest produces a headline return it later
+    # has to retract.
+    #
+    # `pnl_inventory_gross` is the sum of absolute per-step contributions, and
+    # `pnl_inventory_tstat` is the net over the standard error of those
+    # contributions. A position PnL that reflects anything real should sit
+    # several standard errors from zero; |t| < 2 means the number is
+    # indistinguishable from a random walk and must not be reported as
+    # performance.
+    pnl_inventory_gross: float = 0.0
+    pnl_inventory_tstat: float = 0.0
+
+    # Share of fills on price levels the strategy created rather than joined.
+    # Legitimate behaviour -- stepping inside a 15 USD spread is the whole
+    # point of quoting -- but those fills are the ones the replay models
+    # least well, because the historical tape never saw our order and cannot
+    # react to it. High values mean the PnL is a counterfactual.
+    frac_fills_at_new_level: float = 0.0
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -243,6 +269,7 @@ def compute_metrics(
     # quantity bounded and answers the question actually being asked: of the
     # quotes we put in the book, how many ever traded?
     n_placed = float(fill_stats.get("n_placed", 0.0))
+    frac_new_level = float(fill_stats.get("frac_fills_at_new_level", 0.0))
     if n_fills and "order_id" in fills.columns and n_placed > 0:
         quote_fill_rate = float(fills["order_id"].nunique() / n_placed)
     else:
@@ -300,6 +327,20 @@ def compute_metrics(
     # Whatever is not spread capture or fees is inventory mark-to-market.
     pnl_inventory = total_pnl - pnl_spread_capture + fees
 
+    # Scale and significance of the position PnL (see the field docs).
+    inv_steps = tl["inventory"].to_numpy(dtype=float)[:-1] * np.diff(
+        tl["mid"].to_numpy(dtype=float)
+    )
+    inv_steps = inv_steps[np.isfinite(inv_steps)]
+    pnl_inventory_gross = float(np.abs(inv_steps).sum())
+    if len(inv_steps) > 1:
+        se = float(inv_steps.std(ddof=1) * np.sqrt(len(inv_steps)))
+        pnl_inventory_tstat = (
+            float(inv_steps.sum() / se) if se > 1e-12 else 0.0
+        )
+    else:
+        pnl_inventory_tstat = 0.0
+
     return PerformanceMetrics(
         total_pnl=total_pnl,
         annualised_return_on_capital=float(ann_return),
@@ -324,8 +365,11 @@ def compute_metrics(
         markout_bps=markout_bps,
         pnl_spread_capture=pnl_spread_capture,
         pnl_inventory=float(pnl_inventory),
+        pnl_inventory_gross=pnl_inventory_gross,
+        pnl_inventory_tstat=pnl_inventory_tstat,
         pnl_fees=-fees,
         duration_hours=float(duration_h),
+        frac_fills_at_new_level=frac_new_level,
         strategy=strategy,
         # Annualising from a short window is arithmetically fine and
         # statistically meaningless. A 12-minute replay scaled to a year
@@ -344,6 +388,7 @@ def compare(results: dict[str, PerformanceMetrics]) -> pd.DataFrame:
     a strategy wins and where it pays for that win.
     """
     rows = [
+        ("duration (h)", "duration_hours", "{:.1f}"),
         ("total PnL", "total_pnl", "{:,.2f}"),
         ("ann. return", "annualised_return_on_capital", "{:.2%}"),
         ("ann. vol", "annualised_volatility", "{:.2%}"),
@@ -360,8 +405,11 @@ def compare(results: dict[str, PerformanceMetrics]) -> pd.DataFrame:
         ("max |inventory|", "max_abs_inventory", "{:.3f}"),
         ("time at bound", "pct_time_at_bound", "{:.2%}"),
         ("median queue wait (s)", "median_queue_wait_seconds", "{:.3f}"),
+        ("fills at self-made level", "frac_fills_at_new_level", "{:.1%}"),
         ("PnL: spread", "pnl_spread_capture", "{:,.2f}"),
         ("PnL: inventory", "pnl_inventory", "{:,.2f}"),
+        ("  inventory gross", "pnl_inventory_gross", "{:,.0f}"),
+        ("  inventory t-stat", "pnl_inventory_tstat", "{:+.2f}"),
         ("PnL: fees", "pnl_fees", "{:,.2f}"),
     ]
 
@@ -373,7 +421,32 @@ def compare(results: dict[str, PerformanceMetrics]) -> pd.DataFrame:
             col.append(fmt.format(val))
         data[name] = col
 
-    return pd.DataFrame(data, index=[label for label, _, _ in rows])
+    frame = pd.DataFrame(data, index=[label for label, _, _ in rows])
+
+    # Mark the annualised block when the sample is too short to support it.
+    # `summary()` already warns, but this table is what actually gets read,
+    # and an unqualified "50.77%" from a twelve-hour replay invites exactly
+    # the misreading the warning exists to prevent.
+    if results and not all(m.annualisation_is_reliable for m in results.values()):
+        scaled = {"ann. return", "ann. vol", "Sharpe", "Sortino", "Calmar"}
+        frame.index = [
+            f"{label} [!]" if label in scaled else label
+            for label in frame.index
+        ]
+
+    return frame
+
+
+def annualisation_caveat(results: dict[str, PerformanceMetrics]) -> str | None:
+    """Text for the `[!]` markers in `compare`, or None if not needed."""
+    if not results or all(m.annualisation_is_reliable for m in results.values()):
+        return None
+    hours = min(m.duration_hours for m in results.values())
+    return (
+        f"[!] Sample is {hours:.1f} h (< 24 h). Annualised return, volatility, "
+        "Sharpe, Sortino and Calmar are scaled from too short a window to "
+        "mean anything and must not be reported as performance figures."
+    )
 
 
 def _empty_metrics(strategy: str) -> PerformanceMetrics:
