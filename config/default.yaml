@@ -14,7 +14,7 @@ data:
 
 calibration:
   intensity_n_buckets: 12
-  intensity_max_delta_bps: 1.0
+  intensity_max_delta_bps: 6.0     # covers p99.9 of real trade distance (5.54 bps)
   vol_window_seconds: 300.0
   stratify_by_session: true
 
@@ -24,7 +24,9 @@ strategy:
   q_max: 10.0
   order_size: 1.0
   horizon_seconds: 60.0
-  tick_size: 0.5
+  fixed_half_spread_bps: 1.0   # = measured median touch half-spread
+  min_half_spread_bps: 0.125   # one tick at BTC 80k
+  tick_size: null           # null -> Bitfinex 5-significant-digit rule (BTC@76k -> 1.0)
 
 simulation:
   decision_interval_ms: 100

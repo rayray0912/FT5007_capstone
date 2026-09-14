@@ -21,12 +21,15 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from ..config import bitfinex_tick_size
+
 
 def generate_mbo_events(
     n_events: int = 100_000,
     start: str = "2026-09-01 00:00:00",
-    mid_start: float = 111_000.0,
-    tick_size: float = 0.5,
+    mid_start: float = 80_000.0,
+    tick_size: float | None = None,
+    level_spacing_ticks: float = 10.0,
     vol_per_sqrt_sec: float = 0.35,
     mean_event_interval_ms: float = 15.0,
     levels_per_side: int = 20,
@@ -37,8 +40,34 @@ def generate_mbo_events(
 
     Returns a frame with the same columns as `bfx.book_mbo`, so downstream
     code cannot tell the difference between this and a real epoch.
+
+    The scale parameters are matched to measurements on tBTCF0:USTF0 epoch 27
+    rather than chosen for convenience, because they leak. The previous
+    defaults (mid 111,000 with a 0.5 tick and adjacent levels one tick apart)
+    produced a book quoting a ~1 USD spread, and that number was then read
+    back out of the generator and written into the config and the report as
+    though it described Bitfinex. It does not: the real book quotes a median
+    spread of 15 USD at a mid near 80,000 on a 1.0 tick. Every parameter
+    calibrated against the old synthetic scale was therefore calibrated
+    against an artefact.
+
+    `tick_size=None` derives the grid from `mid_start` using the venue rule,
+    which keeps the generated book and the quoter on the same grid
+    automatically. Pass a float only to pin it deliberately.
+
+    `level_spacing_ticks` sets how far apart adjacent price levels sit. At 10
+    it yields a median touch spread of 16 USD against the measured 15, which
+    is the closest the generator gets. The tails still do not match -- the
+    generated spread runs p10 15 / p90 19 against a real p10 13 / p90 25 --
+    because nothing here widens the book under stress. Level and scale are
+    right; spread *variability* is not, so anything sensitive to spread
+    dispersion has to be measured on real data.
     """
     rng = np.random.default_rng(seed)
+
+    if tick_size is None:
+        tick_size = bitfinex_tick_size(mid_start)
+    step_px = tick_size * level_spacing_ticks
 
     t0 = pd.Timestamp(start)
     gaps_ms = rng.exponential(mean_event_interval_ms, n_events)
@@ -58,7 +87,7 @@ def generate_mbo_events(
         for _ in range(orders_per_level):
             for side, sign in (("bid", -1), ("ask", +1)):
                 seq += 1
-                price = _round_tick(snap_mid + sign * lvl * tick_size, tick_size)
+                price = _round_tick(snap_mid + sign * lvl * step_px, tick_size)
                 size = float(np.round(rng.gamma(2.0, 0.5), 4))
                 oid = gen.add(price, side, size)
                 records.append(_row(ts[0], seq, oid, side, "snapshot", price, size))
@@ -84,7 +113,7 @@ def generate_mbo_events(
             side = "bid" if rng.random() < 0.5 else "ask"
             sign = -1 if side == "bid" else +1
             lvl = min(int(rng.geometric(0.22)), levels_per_side)
-            price = _round_tick(m + sign * lvl * tick_size, tick_size)
+            price = _round_tick(m + sign * lvl * step_px, tick_size)
             price = gen.clamp(price, side, m)
             size = float(np.round(rng.gamma(2.0, 0.5), 4))
             oid = gen.add(price, side, size)
