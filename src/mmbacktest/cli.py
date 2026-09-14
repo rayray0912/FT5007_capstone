@@ -35,6 +35,7 @@ from .config import Config
 from .data.book import OrderBook, _is_bid
 from .data.clickhouse_client import MBODataStore
 from .data.synthetic import generate_mbo_events, generate_trades
+from .metrics.performance import annualisation_caveat  # noqa: E402
 from .metrics.performance import compare as compare_metrics, compute_metrics
 from .sim.engine import BacktestEngine
 from .sim.fills import compute_markouts
@@ -75,10 +76,20 @@ def load_data(cfg: Config, synthetic: bool, n_events: int) -> tuple[pd.DataFrame
     epoch = store.resolve_epoch(cfg.data)
     logger.info("using %s", epoch)
 
+    # Trades must span exactly the same window as the book events. Falling
+    # back to the epoch bounds when the config narrows the window loads trades
+    # with no book behind them: intensity calibration then matches them
+    # against a mid series that does not cover their timestamps, and the
+    # replay sees trades arriving after the book has stopped updating. It
+    # shows up as sessions reporting n=0 or n=1 samples for hours that are
+    # not in the requested window at all.
+    window_start = cfg.data.start if cfg.data.start is not None else epoch.start
+    window_end = cfg.data.end if cfg.data.end is not None else epoch.end
+
     events = store.load_book_events(
-        cfg.data.symbol, epoch.epoch, cfg.data.start, cfg.data.end
+        cfg.data.symbol, epoch.epoch, window_start, window_end
     )
-    trades = store.load_trades(cfg.data.symbol, epoch.start, epoch.end)
+    trades = store.load_trades(cfg.data.symbol, window_start, window_end)
     store.close()
 
     label = f"{cfg.data.symbol}@epoch{epoch.epoch}"
@@ -235,6 +246,37 @@ def cmd_compare(args, cfg: Config) -> int:
           f"R2={intensity.r_squared:.3f}")
     print()
     print(table.to_string())
+
+    caveat = annualisation_caveat(all_metrics)
+    if caveat:
+        print()
+        print(caveat)
+
+    weak_inv = [
+        (m.strategy, m.pnl_inventory, m.pnl_inventory_tstat)
+        for m in all_metrics.values()
+        if abs(m.pnl_inventory) > abs(m.pnl_spread_capture)
+        and abs(m.pnl_inventory_tstat) < 2.0
+    ]
+    if weak_inv:
+        print()
+        print("[!] Inventory PnL dominates total PnL but is not statistically")
+        print("    distinguishable from a random walk (|t| < 2). This is not a")
+        print("    result -- it is the residual of a position held through noise:")
+        for label, pnl, t in weak_inv:
+            print(f"      {label:32s} inventory {pnl:>+10,.2f}  t = {t:+.2f}")
+
+    worst_new_level = max(
+        (m.frac_fills_at_new_level for m in all_metrics.values()), default=0.0
+    )
+    if worst_new_level > 0.5:
+        print()
+        print(
+            f"[!] Up to {worst_new_level:.0%} of fills landed on price levels the "
+            "strategy created rather than joined. Those fills never appear\n"
+            "    on the historical tape, so that PnL assumes our quote would not "
+            "have changed the flow that traded against it."
+        )
 
     if args.out:
         _write_outputs(Path(args.out), all_metrics, last_result, provenance, table)

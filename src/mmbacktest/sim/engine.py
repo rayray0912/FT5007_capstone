@@ -103,6 +103,39 @@ class _Position:
         return self.cash + self.inventory * mid
 
 
+def _aggressor_is_buy(trades: pd.DataFrame) -> pd.Series:
+    """Which side initiated each trade.
+
+    This decides everything: a buy aggressor can only lift our ask, a sell
+    aggressor can only hit our bid. Get it wrong in one direction and the
+    strategy can only ever sell.
+
+    The `side` column is authoritative. The raw Bitfinex feed signs `amount`
+    by aggressor direction, but the collector stores the magnitude and keeps
+    the direction in `side`, so reading the sign of `amount` off the database
+    returns True for every row -- every trade looks like a buy, our bids never
+    fill, and the book runs one-way short. On a falling market that produces a
+    healthy-looking profit which is purely the short position.
+
+    The sign of `amount` is used only as a fallback, for the synthetic
+    generator, which does sign it.
+    """
+    if "side" in trades.columns:
+        side = trades["side"].astype(str).str.strip().str.lower()
+        known = side.isin(("buy", "sell"))
+        if known.all():
+            return side.eq("buy")
+        logger.warning(
+            "trades.side has %d unrecognised values; falling back to the sign "
+            "of amount for those rows", int((~known).sum()),
+        )
+        return side.eq("buy") | (~known & (trades["amount"].astype(float) > 0))
+
+    logger.warning("trades frame has no `side` column; inferring aggressor "
+                   "from the sign of amount")
+    return trades["amount"].astype(float) > 0
+
+
 class BacktestEngine:
     """Replays an event stream against a quoting strategy."""
 
@@ -126,6 +159,7 @@ class BacktestEngine:
 
         self._fills: list[Fill] = []
         self._timeline: list[dict] = []
+        self._replay_start: float | None = None
         self._open_order_ids: list[int] = []
 
     # ------------------------------------------------------------------
@@ -255,6 +289,17 @@ class BacktestEngine:
         if mid is None or bid is None or ask is None:
             return
 
+        # Book warm-up. Unless the window starts at a snapshot, the book is
+        # rebuilt from the incremental stream and its touch is far too wide
+        # until enough orders have arrived. Quoting into that fictitious
+        # spread produces fills no real maker could have had, so we stay out
+        # of the market and record nothing until it has settled. Events are
+        # still consumed: the book fills and sigma warms up as normal.
+        if self._replay_start is None:
+            self._replay_start = now
+        if now - self._replay_start < self.cfg.simulation.warmup_seconds:
+            return
+
         # Do not quote until the volatility estimate has warmed up. Quoting on
         # a floor sigma would produce a spread that reflects nothing.
         if not self.vol.is_warm:
@@ -270,7 +315,9 @@ class BacktestEngine:
             imbalance=book.imbalance(),
             sigma=self.vol.sigma,
             kappa=self.intensity.kappa,
-            A=self.intensity.A,
+            # GLFT's A is an arrival intensity, not the fitted density.
+            # See IntensityEstimate.arrival_intensity.
+            A=self.intensity.arrival_intensity,
             inventory=self.position.inventory,
             time_remaining=horizon,
         )
@@ -377,8 +424,7 @@ class BacktestEngine:
                 "_kind": "trade",
                 "trade_price": trades["price"].astype(float),
                 "trade_size": trades["amount"].abs().astype(float),
-                # Bitfinex signs trade amount by the aggressor's direction.
-                "aggressor_is_buy": trades["amount"].astype(float) > 0,
+                "aggressor_is_buy": _aggressor_is_buy(trades),
                 "order_id": 0,
                 "side": "bid",
                 "action": "trade",
@@ -391,7 +437,22 @@ class BacktestEngine:
             merged = ev
 
         merged = merged.sort_values(["_ts", "_kind"], kind="stable")
+
+        # Normalise to nanoseconds before converting. `astype("int64")` on a
+        # datetime column returns whatever the column's *resolution* is, not
+        # nanoseconds, and pandas >= 2 preserves the source resolution instead
+        # of coercing everything to ns.
+        #
+        # ClickHouse hands back DateTime64(3), i.e. datetime64[ms], so the old
+        # `astype("int64") / 1e9` divided milliseconds by a nanosecond scale
+        # and produced timestamps 1e6 too small: a two-hour replay spanned
+        # 0.0072 "seconds", the 100 ms decision clock never came due, and the
+        # engine placed zero orders over the entire window.
+        #
+        # It only ever bit on real data. The synthetic generator builds its
+        # index with pd.to_timedelta, which is datetime64[ns], so the whole
+        # test suite and every offline run took the correct branch by accident.
         merged["_ts_seconds"] = (
-            merged["_ts"].astype("int64") / 1e9
+            merged["_ts"].dt.as_unit("ns").astype("int64") / 1e9
         )
         return merged.reset_index(drop=True)
