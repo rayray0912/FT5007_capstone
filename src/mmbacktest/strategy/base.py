@@ -23,7 +23,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..config import StrategyConfig
+from ..config import (
+    StrategyConfig,
+    bitfinex_tick_size,
+    is_on_tick_grid,
+    round_to_tick,
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +97,22 @@ class Quoter(ABC):
         """Return the quote for this decision point."""
 
     # ------------------------------------------------------------------
+    # Price grid
+    # ------------------------------------------------------------------
+
+    def tick_for(self, price: float) -> float:
+        """Tick size applicable at `price`.
+
+        `cfg.tick_size` of None means "ask the venue rule", which is the
+        correct behaviour against real data because Bitfinex's tick is a
+        function of price. A float pins the grid, which synthetic data and
+        tests need since there is no venue to ask.
+        """
+        if self.cfg.tick_size is not None:
+            return self.cfg.tick_size
+        return bitfinex_tick_size(price)
+
+    # ------------------------------------------------------------------
     # Shared post-processing
     # ------------------------------------------------------------------
 
@@ -120,21 +141,42 @@ class Quoter(ABC):
         hi = self.cfg.max_half_spread_bps * mid / 10_000.0
         half_spread = float(np.clip(half_spread, lo, hi))
 
-        tick = self.cfg.tick_size
         raw_bid = reservation - half_spread
         raw_ask = reservation + half_spread
 
+        # The tick is a function of price on this venue, not a constant, so
+        # each side is snapped on its own grid. The two agree except in the
+        # rare case where a quote straddles a power of ten.
+        bid_tick = self.tick_for(raw_bid)
+        ask_tick = self.tick_for(raw_ask)
+
         # Round outward: bids down, asks up. Rounding inward would post a
         # tighter quote than the model chose, which biases fills upward.
-        bid_price = float(np.floor(raw_bid / tick) * tick)
-        ask_price = float(np.ceil(raw_ask / tick) * tick)
+        bid_price = round_to_tick(raw_bid, bid_tick, "down")
+        ask_price = round_to_tick(raw_ask, ask_tick, "up")
 
         # Never quote through the opposite side of the book. Crossing would
         # make us a taker, which is a different strategy entirely.
+        #
+        # Stepping back by one tick has to land on the grid the *touch* sits
+        # on, so the tick is taken at the touch price rather than at ours.
         if bid_price >= state.best_ask:
-            bid_price = state.best_ask - tick
+            bid_price = round_to_tick(
+                state.best_ask - self.tick_for(state.best_ask), bid_tick, "down"
+            )
         if ask_price <= state.best_bid:
-            ask_price = state.best_bid + tick
+            ask_price = round_to_tick(
+                state.best_bid + self.tick_for(state.best_bid), ask_tick, "up"
+            )
+
+        # An off-grid quote is a silent instant-fill bug in the queue model
+        # (no depth can exist at a price the venue cannot represent), so it
+        # is asserted rather than assumed.
+        for px, tk in ((bid_price, bid_tick), (ask_price, ask_tick)):
+            if not is_on_tick_grid(px, tk):
+                raise AssertionError(
+                    f"{self.name}: quote {px!r} is off the {tk!r} tick grid"
+                )
 
         q = self.cfg.order_size
         q_max = self.cfg.q_max

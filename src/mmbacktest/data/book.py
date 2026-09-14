@@ -84,7 +84,13 @@ class PriceLevel:
 class OrderBook:
     """Order-level limit order book for one instrument."""
 
-    def __init__(self, tick_size: float = 0.5):
+    def __init__(self, tick_size: float | None = None):
+        # Recorded for reference only: reconstruction keys levels by the exact
+        # prices the exchange sent, so the book never needs to know the grid.
+        # It is deliberately NOT used to round or bucket anything -- doing so
+        # would impose a grid on data that already has one, and an incorrect
+        # value here should not be able to corrupt the book. The quoter, which
+        # does need the grid, derives it per price (see config.bitfinex_tick_size).
         self.tick_size = tick_size
         self._orders: dict[int, Order] = {}
         self._bids: dict[float, PriceLevel] = {}
