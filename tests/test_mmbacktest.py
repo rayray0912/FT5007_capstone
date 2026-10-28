@@ -864,3 +864,100 @@ class TestGLFTInventoryUnits:
         assert long_b > flat_b     # bid pushed away when long
         assert long_a < flat_a     # ask pulled in when long
         assert (long_b - flat_b) > 1.0
+
+
+class TestDerivBackfillParsing:
+    """Field positions in the /status/deriv/hist payload.
+
+    The `hist` rows omit the leading KEY field that the snapshot endpoint
+    carries, so every index is one lower than Bitfinex's published field
+    table. An off-by-one here is silent and plausible-looking: mark price
+    becomes spot price, or the funding rate becomes the funding step. The
+    fixture is a real payload slice spanning an 8h settlement boundary.
+    """
+
+    @staticmethod
+    def _load():
+        import importlib.util
+        import json
+
+        root = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "backfill_deriv", root / "scripts" / "backfill_deriv.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        raw = json.loads(
+            (root / "tests" / "fixtures" / "deriv_hist_btc.json").read_text()
+        )
+        return mod, raw
+
+    def test_every_row_parses(self):
+        mod, raw = self._load()
+        df = mod.to_frame("tBTCF0:USTF0", raw)
+        assert len(df) == len(raw)
+
+    def test_fields_match_the_raw_row(self):
+        """Positional check against the payload, field by field."""
+        mod, raw = self._load()
+        df = mod.to_frame("tBTCF0:USTF0", raw).sort_values("ts").reset_index(drop=True)
+        r = sorted(raw, key=lambda x: x[0])[0]
+        got = df.iloc[0]
+
+        assert got["ts"].value // 10**6 == r[0]
+        assert got["deriv_price"] == pytest.approx(r[2])
+        assert got["spot_price"] == pytest.approx(r[3])
+        assert got["insurance_fund"] == pytest.approx(r[5])
+        assert got["next_funding_ts"].value // 10**6 == r[7]
+        assert got["next_funding_accrued"] == pytest.approx(r[8])
+        assert got["next_funding_step"] == int(r[9])
+        assert got["mark_price"] == pytest.approx(r[14])
+        assert got["open_interest"] == pytest.approx(r[17])
+
+    def test_settlements_land_on_the_eight_hour_grid(self):
+        """The sharpest guard against an index shift.
+
+        Bitfinex settles funding at 00:00, 08:00 and 16:00 UTC. If the
+        timestamp index were off by one we would be reading the funding step
+        (an integer in the thousands) or the insurance fund, and the hours
+        would be arbitrary.
+        """
+        mod, raw = self._load()
+        df = mod.to_frame("tBTCF0:USTF0", raw)
+        assert set(df["next_funding_ts"].dt.hour.unique()) <= {0, 8, 16}
+        assert (df["next_funding_ts"].dt.minute == 0).all()
+
+    def test_values_are_in_plausible_ranges(self):
+        """Catches a swap between two fields that are both well-formed."""
+        mod, raw = self._load()
+        df = mod.to_frame("tBTCF0:USTF0", raw)
+        assert df["deriv_price"].between(10_000, 500_000).all()
+        assert df["spot_price"].between(10_000, 500_000).all()
+        assert df["mark_price"].between(10_000, 500_000).all()
+        # A funding rate is a small fraction; the step is a whole-number
+        # counter that climbs through the 8h window and resets at settlement
+        # (so it is legitimately small just after one -- the fixture spans a
+        # boundary and contains 17 and 37). Confusing the two is the likeliest
+        # single-index error, so discriminate on integrality and on the
+        # within-window maximum rather than on every row's magnitude.
+        assert df["next_funding_accrued"].abs().lt(0.01).all()
+        assert (df["next_funding_step"] % 1 == 0).all()
+        assert df["next_funding_step"].max() > 1_000
+        assert not (df["next_funding_accrued"] % 1 == 0).all()
+
+    def test_timestamps_carry_utc_and_survive_resolution(self):
+        """Same class of bug as the engine's ms/ns defect: assert the unit."""
+        mod, raw = self._load()
+        df = mod.to_frame("tBTCF0:USTF0", raw)
+        for col in ("ts", "next_funding_ts"):
+            assert str(df[col].dt.tz) == "UTC"
+            # Seconds since epoch must be a real 2026 timestamp, not 1.79e9/1e6.
+            secs = df[col].iloc[0].timestamp()
+            assert 1.7e9 < secs < 1.9e9, f"{col} came back as {secs}"
+
+    def test_rows_without_a_timestamp_are_dropped_not_zeroed(self):
+        mod, raw = self._load()
+        broken = [list(raw[0]), list(raw[1])]
+        broken[0][0] = None
+        df = mod.to_frame("tBTCF0:USTF0", broken)
+        assert len(df) == 1
