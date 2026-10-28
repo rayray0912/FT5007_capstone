@@ -273,6 +273,85 @@ inventory machinery does what the theory says it does. They do not say the
 strategy is profitable, and on this instrument at these fee tiers the totals
 are negative more often than not.
 
+### Funding and rebate across 15 epochs
+
+BTC-PERP, every epoch of at least 20 h except epoch 0 (possibly discontinuous),
+γ = 1e-3, maker rebate −1 bp, funding charged at each 8h settlement on the
+signed position held at that instant. Settled rates were backfilled from
+Bitfinex REST (`scripts/backfill_deriv.py`). Reproduce with
+`python scripts/funding_report.py --exclude-epochs 68` and without the flag.
+
+**Epoch 68 is excluded from the headline figures and reported alongside.** It
+contains the only flash move in the dataset -- BTC-PERP traded from 81,200 to
+153,960 and back in about 1.5 s on 2026-09-20 16:28, the single one-minute
+window across 59 days and three symbols with a trade more than 2% from that
+minute's median. The quoters re-centre on the spiked mid and are filled there
+before it snaps back, which produces totals near −100k to −170k for all three
+strategies, symmetric included. The exclusion criterion is mechanical, not a
+judgement about which results look wrong.
+
+**Replay is reproducible.** Eight of these epochs were also in the September
+sweep. Fill count, spread capture, inventory PnL, inventory variance and mean
+absolute inventory are identical on all 24 strategy-epochs -- including four
+epochs replayed after the quote-hygiene reorder that fixed the epoch-68 crash,
+which is the real-data check that the reorder changed nothing it should not.
+
+**Funding: large and two-signed for symmetric, small for AS and GLFT.**
+
+| 14 epochs, excl. 68 | paid on | received on | net | median / epoch | range | median cost / spread capture |
+|---|---|---|---|---|---|---|
+| symmetric | 6 | 8 | −1,066 | +117 | −1,560 … +1,222 | −42% |
+| avellaneda_stoikov | 7 | 7 | −33 | −12 | −148 … +131 | 2% |
+| glft | 7 | 7 | −206 | −19 | −197 … +155 | 4% |
+
+The epoch-27 figures quoted earlier (funding at 368% of symmetric's spread
+capture) were true of epoch 27 and are not representative of the sign. Epoch 27
+fell 0.95% with funding positive at every settlement; symmetric, accumulating
+against the trend, was long throughout and paid every time. Across 14 epochs it
+receives funding more often than it pays. What does generalise is the
+*magnitude*: funding scales with inventory, so it is a variance term for the
+quoter that does not control inventory and close to negligible for the two
+that do. It does not systematically flatter or penalise anyone.
+
+**Totals, built up leg by leg.** Count of epochs with PnL > 0:
+
+| 14 epochs, excl. 68 | spread + inventory | + rebate | + funding (= total) | spread + rebate + funding (no MTM) |
+|---|---|---|---|---|
+| symmetric | 8 | 8 | 9 | 13 |
+| avellaneda_stoikov | 6 | 11 | 11 | 14 |
+| glft | 5 | 9 | 10 | 14 |
+
+No pairwise difference in total PnL is significant (paired sign tests, all
+p ≥ 0.42). The rebate is what moves AS and GLFT from mostly negative to mostly
+positive; for symmetric the median rebate per epoch (+845) exceeds the median
+spread capture (+533), so at this tier the subsidy is the larger part of its
+revenue.
+
+The last column removes the inventory mark-to-market and is positive almost
+everywhere. GLFT beats AS on it in 12 of 14 epochs (p = 0.013). Read that
+carefully: it is in USD, so it largely tracks turnover (GLFT fills more than AS
+at γ = 1e-3, and the rebate is proportional to notional), and section 4.3 of
+the handoff shows AS-versus-GLFT comparisons at equal γ are not fair
+comparisons at all. It is a lead for the matched-inventory-variance analysis,
+not a result.
+
+**Pooled sums and medians disagree, which is the point.**
+
+| total PnL | pooled, 14 epochs | median / epoch, 14 | pooled, 15 (incl. 68) | median / epoch, 15 |
+|---|---|---|---|---|
+| symmetric | −7,097 | +903 | −102,012 | +718 |
+| avellaneda_stoikov | +5,548 | +240 | −166,647 | +234 |
+| glft | +5,950 | +335 | −116,618 | +261 |
+
+Excluding epoch 68, the pooled sum ranks symmetric last and the median ranks it
+first: a few large inventory losses dominate its sum. Including epoch 68 flips
+every pooled total to a six-figure loss, while the medians barely move. Epoch 68
+also inflates pooled spread capture by about 55,000 for symmetric and GLFT --
+fills against a mid near 148,000 score as enormous "captured spread" -- which is
+another reason not to read pooled spread capture over a window containing it.
+Totals on this instrument remain a statement about inventory noise, with or
+without funding.
+
 ### What still limits the results
 
 - **84–92% of fills land on price levels the strategy created rather than
@@ -283,6 +362,9 @@ are negative more often than not.
 - **Four epochs on one instrument over one fortnight.** Spread capture is
   consistent across an up, a flat and a down epoch, but that is three
   observations of a ratio, not a distribution.
+- **One flash move dominates any PnL sum that includes it** (epoch 68, above).
+  Sign tests and medians are robust to it; sums and means are not. Every pooled
+  PnL figure in this report states whether epoch 68 is in it.
 - **Adverse selection is horizon-dependent in a way that undermines a single
   number.** GLFT's markouts on epoch 27 ran +1.574 bps at 100 ms, −1.202 at
   1 s, +0.108 at 5 s and +4.384 at 30 s. The reported figure takes the longest
@@ -429,8 +511,9 @@ pooled fit describes neither regime.
    `bfx.deriv_status`; the engine charges each 8h settlement on the signed
    position held at that instant, and attribution carries funding as a
    fourth leg. On epoch 27 it costs symmetric 1,595 against 433 of spread
-   capture (368%), AS 116 against 586 (20%), GLFT 173 against 622 (28%). The
-   attribution sums exactly: inventory PnL is unchanged by adding it, and
+   capture (368%), AS 116 against 586 (20%), GLFT 173 against 622 (28%) -- but
+   epoch 27 is not representative of the sign: across 14 epochs symmetric
+   receives funding in 8 (section 3). The attribution sums exactly: inventory PnL is unchanged by adding it, and
    total PnL falls by precisely the funding term. Mean settled rates over the
    backfill: BTC +0.029%, ETH +0.025%, XAUT -0.003% per 8h -- XAUT's funding
    runs the other way. Adding `status:deriv` to the collector would only buy

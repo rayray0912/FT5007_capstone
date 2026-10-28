@@ -278,8 +278,9 @@ epoch 68 is 95% of AS's pooled loss at gamma=1e-3 and 98% at 1e-2, 89% of
 GLFT's, 56% of symmetric's -- in all three strategies, including symmetric,
 which ignores sigma, because the quoters re-centre on a mid of ~148,000 and
 are filled there before it snaps back. Sign tests and medians are robust to
-it; sums and means are not. **Decide** whether epoch 68 is excluded from PnL
-magnitudes (objective criterion above), or kept and reported both ways.
+it; sums and means are not. **Decided (2026-10-28):** epoch 68 is excluded
+from headline PnL magnitudes and every such figure is also reported with it
+included (`funding_report.py --exclude-epochs 68`, and without the flag).
 `results/sweep/.../gamma_0.0001/epoch_68` now holds the re-run (no funding,
 zero fees, to match the other 61); the failed attempt is kept as
 `run.failed_20260928.log`. The whole sweep is now 62/62 at all three gammas.
@@ -321,7 +322,13 @@ user). The engine charges each 8h settlement on the signed position held at
 that instant; attribution carries `PnL: funding` as a fourth leg and the four
 legs sum to total PnL exactly. Funding does not feed back into quoting, so it
 never changes fills, spread capture or inventory paths -- only cash. Runs
-without a funding schedule print "not modelled" rather than zero. Backfill
+without a funding schedule print "not modelled" rather than zero.
+Result over 15 epochs ≥20 h at γ=1e-3, rebate −1 bp (`results/sweep_funding`,
+progress report §3): funding is large and two-signed for symmetric (received
+in 8 of 14 epochs excl. 68, per-epoch −1,560…+1,222) and small for AS/GLFT
+(median 2–4% of spread capture). The epoch-27 "368% of spread capture" figure
+is not representative of the sign. No pairwise total-PnL difference is
+significant. Backfill
 coverage is per window: `--full` for a whole symbol, `--epochs-min-hours N` for
 long epochs only. The collector was not touched; a restart would be safe if
 live collection is ever wanted (epoch counter resumes from `max(epoch)`).

@@ -105,8 +105,8 @@ def load_data(
     if funding.empty:
         logger.warning(
             "no funding data for this window -- run scripts/backfill_deriv.py. "
-            "Results will omit the funding component of inventory cost, which "
-            "favours strategies that carry more inventory."
+            "Results will omit funding, a leg whose size scales with inventory "
+            "and whose sign depends on the regime."
         )
     store.close()
 

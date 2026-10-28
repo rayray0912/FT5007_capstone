@@ -5,10 +5,13 @@ Why this exists
 ---------------
 The collector does not subscribe to `status:deriv`, so the dataset has no
 funding data. For a perpetual swap, funding is a real component of the cost of
-holding inventory, and leaving it out does not bias results neutrally: the
-charge scales with position size, so it penalises exactly the strategies that
-fail to control inventory. Measured on BTC-PERP epoch 27, funding is 440% of
-the naive quoter's entire spread capture against 40% for AS and GLFT.
+holding inventory. Its size scales with position, so it matters most for a
+quoter without inventory control; its sign does not favour anyone in
+particular. On BTC-PERP epoch 27, a falling market with positive funding
+throughout, it cost the naive quoter 368% of its spread capture against 20%
+and 28% for AS and GLFT -- but across 14 epochs the naive quoter received
+funding in 8 and paid in 6, and it netted to -1,066 against +6,597 of spread
+capture. Epoch 27 is not representative of the sign.
 
 It turns out this does not need the collector changed. The public endpoint
 

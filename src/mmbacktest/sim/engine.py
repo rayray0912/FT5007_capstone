@@ -217,9 +217,10 @@ class BacktestEngine:
         `funding` is optional and carries one row per 8h settlement, with
         columns `settles_at`, `rate` and `mark_at_settle` (see
         MBODataStore.load_funding). Omitting it leaves funding out of the
-        attribution entirely, which is not a neutral choice: the charge
-        scales with position size, so dropping it flatters whichever
-        strategy controls inventory worst.
+        attribution entirely. The charge scales with position size, so the
+        omission matters most for the strategy that controls inventory
+        worst -- but in either direction, since whether a position pays or
+        receives depends on its sign at each settlement.
         """
         merged = self._merge_streams(events, trades)
         fund_ts, fund_rate, fund_mark = self._funding_schedule(funding)

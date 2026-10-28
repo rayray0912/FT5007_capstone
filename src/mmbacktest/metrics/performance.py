@@ -104,8 +104,12 @@ class PerformanceMetrics:
     pnl_inventory_tstat: float = 0.0
     # Funding is the fourth leg of the attribution and the one specific to a
     # perpetual. It is charged on the position held at each 8h settlement, so
-    # it scales with inventory: leaving it out does not bias the comparison
-    # neutrally, it flatters whichever strategy controls inventory worst.
+    # its size scales with inventory; its sign depends on whether the book is
+    # long or short when the rate is positive or negative, which varies by
+    # regime. Over 14 BTC epochs the naive quoter received funding in 8 and
+    # paid in 6 (per-epoch -1,560 to +1,222) while AS and GLFT stayed within
+    # roughly +/-200: it is a variance term for poor inventory control, not
+    # a cost it reliably pays.
     # Zero with `n_funding_events == 0` means funding was not modelled, which
     # is a different statement from funding having netted to zero.
     pnl_funding: float = 0.0
