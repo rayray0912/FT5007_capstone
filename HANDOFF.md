@@ -322,6 +322,26 @@ result can be reported: a gain supports the intraday-structure claim, and no
 gain motivates online estimation.
 *Done =* the paired table and sign tests in `results/session/`.
 
+Done (2026-10-28): **no gain.** `--session-intensity` (config
+`calibration.session_intensity`, off by default) switches κ/A via
+`IntensitySchedule`; unusable session fits fall back to pooled and the
+share of decisions is reported (`frac_decisions_intensity_fallback`). Session
+A is now divided by the time actually observed in each session (coverage
+split at hour boundaries) instead of span×hours/24; the pooled fit is
+unchanged, so no static result moved. Results: `results/session/`
+(walk-forward 24 h, γ=1e-3, zero fees, no funding, 62 epochs), compared
+with `results/sweep_wf` by `scripts/compare_session.py`. Symmetric identical
+across arms. Spread capture and inventory variance: session better on
+27–30/61 for AS and GLFT, all sign p ≥ 0.44. One hint (AS mean |inv| −2.9%,
+Wilcoxon p=0.0098, sign 36/61 p=0.2) does not survive 14 comparisons. Why:
+the previous day's session κ predicts the replay's session κ no better than
+the pooled κ does (median |log err| 0.167 both, 61/115 p=0.58). Systematic
+pattern exists (13–17 κ −13%, 21–00 +12% vs pooled, medians) but one-day
+session fits miss by ~17%. 06–09 and 21–00 unusable in 17/18 of 62 windows.
+Slide 12's right-hand table can now carry these real numbers. Open: a 72 h
+look-back (both arms re-run) or a multi-day session multiplier on the pooled
+κ -- not yet run.
+
 **4. Matched-risk AS vs GLFT.** Add γ points (for example 3e-4, 3e-3, 3e-2) and
 compare spread capture at equal inventory variance (see §4.3).
 *Done =* one figure of capture vs inventory variance per strategy, with the

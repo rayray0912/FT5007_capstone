@@ -1,0 +1,42 @@
+tBTCF0_USTF0 gamma=0.001: static 62 epochs, session 62
+
+=== 1. symmetric sanity check (62 shared epochs) ===
+  n_fills                identical
+  spread_capture_bps     identical
+  inventory_variance     identical
+  mean_abs_inventory     identical
+  pnl_inventory          identical
+
+=== 2. session vs static, paired over epochs ===
+        metric                   median static    median Δ     Δ %    better   sign p  wilcoxon p
+  AS    spread_capture_bps               1.388   -0.007217   -0.5%     28/61     0.61        0.45
+  AS    pnl_spread_capture               129.7      -1.192   -0.9%     23/61    0.072        0.13
+  AS    inventory_variance              0.1735  +0.0002238   +0.2%     29/61      0.8        0.74
+  AS    mean_abs_inventory              0.4097    -0.01103   -2.9%     36/61      0.2      0.0098
+  AS    adverse_selection_bps            1.453   +0.000105   +0.0%     30/61        1        0.83
+  AS    n_fills                          464.5          -3   -0.2%         -      nan        0.91
+  AS    total_pnl                       -83.59      +19.48   +4.2%     38/61    0.072        0.03
+  GLFT  spread_capture_bps               1.191   -0.001382   -0.1%     30/61        1        0.65
+  GLFT  pnl_spread_capture               144.3     -0.6677   -0.8%     27/61     0.44         0.7
+  GLFT  inventory_variance              0.2646   +0.001946   +1.4%     27/61     0.44        0.77
+  GLFT  mean_abs_inventory              0.5528    -0.01522   -2.7%     34/61     0.44        0.14
+  GLFT  adverse_selection_bps            1.554   -0.001098   -0.2%     31/61        1        0.58
+  GLFT  n_fills                          611.5        +6.5   +1.0%         -      nan        0.73
+  GLFT  total_pnl                        2.174      -18.91  -11.9%     27/61     0.44        0.33
+
+=== 3. how much of the session arm ran on session fits ===
+  decisions on the pooled fallback: median 0.0%, mean 14.6%, max 100.0%; 38/62 epochs never fell back
+  sessions with an unusable walk-forward fit (epochs): 00-06 8, 06-09 17, 09-13 11, 13-17 3, 17-21 7, 21-00 18
+
+=== 4. does the session kappa from the day before predict the replay's? ===
+  115 (epoch, session) pairs where both fits are usable
+  median |log error| vs the replay's session kappa: session fit 0.167, pooled fit 0.167
+  session fit closer on 61/115, sign p=0.58
+  epochs >= 6 h only (28 epochs, 83 pairs): session closer on 43/83, sign p=0.83
+  walk-forward session kappa / pooled kappa, median across epochs:
+    00-06: +8.1%  (n=19)
+    06-09: +3.3%  (n=11)
+    09-13: +1.7%  (n=21)
+    13-17: -13.2%  (n=31)
+    17-21: +7.0%  (n=23)
+    21-00: +12.4%  (n=10)

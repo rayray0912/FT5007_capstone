@@ -399,6 +399,58 @@ PnL ones, which were noise before and are noise now. Reproduce with
 `python scripts/compare_calibration.py` (add `--exclude-epochs 68` for the
 other basis); results are in `results/sweep_wf`.
 
+### Session-switching κ/A: no gain
+
+The dataset has a 3.7× intraday swing in event rate, which suggested quoting
+on per-session intensity fits rather than one pooled fit. `--session-intensity`
+switches κ and A at the UTC session boundaries (00, 06, 09, 13, 17, 21), using
+walk-forward fits from the 24 h before each epoch; a session whose fit is
+unusable falls back to the pooled one, and the share of decisions that did so
+is reported. Static arm: the walk-forward sweep above. Session arm: identical
+but for the flag. Symmetric is identical across the two on all 62 epochs.
+
+| γ=1e-3, 61 epochs* | median static | median change | session better | sign p | Wilcoxon p |
+|---|---|---|---|---|---|
+| AS spread capture (bps) | 1.388 | −0.5% | 28/61 | 0.61 | 0.45 |
+| AS inventory variance | 0.1735 | +0.2% | 29/61 | 0.80 | 0.74 |
+| AS mean abs inventory | 0.4097 | −2.9% | 36/61 | 0.20 | 0.0098 |
+| GLFT spread capture (bps) | 1.191 | −0.1% | 30/61 | 1.00 | 0.65 |
+| GLFT inventory variance | 0.2646 | +1.4% | 27/61 | 0.44 | 0.77 |
+| GLFT mean abs inventory | 0.5528 | −2.7% | 34/61 | 0.44 | 0.14 |
+
+\*One epoch ran entirely on the pooled fallback and is identical in both arms.
+Excluding epoch 68 moves no count by more than one and no conclusion.
+
+Neither primary metric moves for either strategy. AS's mean absolute
+inventory falls by a median 2.9% with Wilcoxon p = 0.0098, but its sign test is
+36/61 (p = 0.2), its inventory variance does not fall with it, and it is one of
+14 metric-strategy comparisons in the table (Bonferroni threshold 0.0036): it
+is not reported as a finding. AS total PnL improves on 38/61 (Wilcoxon p = 0.03)
+and GLFT's worsens on 34/61; both are inventory noise. Restricting to the 38
+epochs that never fell back to the pooled fit changes nothing: spread capture
+and inventory variance are better under session switching on 17/38 for both
+strategies.
+
+The reason is visible before any replay. For 115 (epoch, session) pairs where
+both fits are usable, the previous day's *session* κ is no closer to the κ
+fitted on that session of the replay itself than the previous day's *pooled*
+κ is: median absolute log error 0.167 for both, session closer on 61/115
+(p = 0.58; 43/83 on epochs of 6 h or more). There is a systematic pattern --
+median across epochs, 13–17 UTC κ sits 13% below the pooled level and 21–00
+UTC 12% above -- but a single day's session fit misses its target by about 17%,
+so switching on it adds as much noise as signal. The thin sessions make this
+worse: 06–09 and 21–00 were unusable in 17 and 18 of the 62 windows, and 14.6%
+of decisions overall ran on the fallback.
+
+So per-session fits from one day do not help, and this is a statement about the
+estimator, not about whether intraday structure exists. Two things would
+separate them: a longer look-back per session (72 h triples each session's
+sample), or a pooled κ scaled by a session multiplier estimated over many days,
+which uses the stable part of the pattern without refitting each session on a
+few hundred trades. Either is a step towards the online estimation in the
+adaptive ladder. Reproduce with `python scripts/compare_session.py
+[--exclude-epochs 68]`; tables are in `results/session/`.
+
 ### What still limits the results
 
 - **84–92% of fills land on price levels the strategy created rather than
