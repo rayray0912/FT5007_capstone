@@ -21,7 +21,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -48,7 +48,9 @@ logger = logging.getLogger(__name__)
 # Data acquisition
 # --------------------------------------------------------------------------
 
-def load_data(cfg: Config, synthetic: bool, n_events: int) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+def load_data(
+    cfg: Config, synthetic: bool, n_events: int
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
     """Return (book events, trades, provenance label)."""
     if synthetic:
         logger.warning(
@@ -56,7 +58,8 @@ def load_data(cfg: Config, synthetic: bool, n_events: int) -> tuple[pd.DataFrame
         )
         events = generate_mbo_events(n_events=n_events, seed=cfg.seed)
         trades = generate_trades(events, trade_rate=0.02, seed=cfg.seed)
-        return events, trades, "synthetic"
+        # No funding on synthetic data: there is no venue to charge it.
+        return events, trades, pd.DataFrame(), "synthetic"
 
     store = MBODataStore(cfg.clickhouse)
     if not store.ping():
@@ -90,10 +93,25 @@ def load_data(cfg: Config, synthetic: bool, n_events: int) -> tuple[pd.DataFrame
         cfg.data.symbol, epoch.epoch, window_start, window_end
     )
     trades = store.load_trades(cfg.data.symbol, window_start, window_end)
+
+    # Funding settlements bracketing the window. Widened by one interval so a
+    # settlement sitting on a window edge is present rather than silently
+    # dropped; the engine only charges those the replay clock actually passes.
+    funding = store.load_funding(
+        cfg.data.symbol,
+        window_start - timedelta(hours=8),
+        window_end + timedelta(hours=8),
+    )
+    if funding.empty:
+        logger.warning(
+            "no funding data for this window -- run scripts/backfill_deriv.py. "
+            "Results will omit the funding component of inventory cost, which "
+            "favours strategies that carry more inventory."
+        )
     store.close()
 
     label = f"{cfg.data.symbol}@epoch{epoch.epoch}"
-    return events, trades, label
+    return events, trades, funding, label
 
 
 def calibrate_intensity(
@@ -175,6 +193,7 @@ def run_one(
     trades: pd.DataFrame,
     intensity: IntensityEstimate,
     strategy_name: str,
+    funding: pd.DataFrame | None = None,
 ):
     """Replay one strategy and return its metrics."""
     run_cfg = Config.from_dict(cfg.to_dict())
@@ -182,7 +201,7 @@ def run_one(
 
     quoter = make_quoter(run_cfg.strategy)
     engine = BacktestEngine(run_cfg, quoter, intensity)
-    result = engine.run(events, trades)
+    result = engine.run(events, trades, funding=funding)
 
     fills_df = compute_markouts(
         result.fills,
@@ -196,15 +215,20 @@ def run_one(
         q_max=run_cfg.strategy.q_max,
         markout_horizons_ms=run_cfg.simulation.markout_horizons_ms,
         strategy=strategy_name,
+        funding_stats=result.funding_stats,
     )
     return metrics, result
 
 
 def cmd_run(args, cfg: Config) -> int:
-    events, trades, provenance = load_data(cfg, args.synthetic, args.n_events)
+    events, trades, funding, provenance = load_data(
+        cfg, args.synthetic, args.n_events
+    )
     intensity = calibrate_intensity(cfg, events, trades)
 
-    metrics, result = run_one(cfg, events, trades, intensity, cfg.strategy.name)
+    metrics, result = run_one(
+        cfg, events, trades, intensity, cfg.strategy.name, funding=funding
+    )
 
     print()
     print(f"data: {provenance}")
@@ -217,7 +241,9 @@ def cmd_run(args, cfg: Config) -> int:
 
 
 def cmd_compare(args, cfg: Config) -> int:
-    events, trades, provenance = load_data(cfg, args.synthetic, args.n_events)
+    events, trades, funding, provenance = load_data(
+        cfg, args.synthetic, args.n_events
+    )
     intensity = calibrate_intensity(cfg, events, trades)
 
     strategies = ["symmetric", "avellaneda_stoikov", "glft"]
@@ -233,7 +259,9 @@ def cmd_compare(args, cfg: Config) -> int:
             label = f"{name} @ {fee:+.1f}bp"
             logger.info("running %s", label)
 
-            metrics, result = run_one(run_cfg, events, trades, intensity, name)
+            metrics, result = run_one(
+                run_cfg, events, trades, intensity, name, funding=funding
+            )
             metrics.strategy = label
             all_metrics[label] = metrics
             last_result = result

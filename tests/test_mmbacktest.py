@@ -961,3 +961,102 @@ class TestDerivBackfillParsing:
         broken[0][0] = None
         df = mod.to_frame("tBTCF0:USTF0", broken)
         assert len(df) == 1
+
+
+class TestFunding:
+    """Funding is charged on the position held at each 8h settlement."""
+
+    def test_long_pays_when_rate_is_positive(self):
+        from mmbacktest.sim.engine import _Position
+        p = _Position(inventory=2.0)
+        charge = p.apply_funding(rate=0.0005, mark_price=80_000.0)
+        assert charge == pytest.approx(2.0 * 80_000.0 * 0.0005)   # 80 USD
+        assert p.cash == pytest.approx(-80.0)
+        assert p.funding_paid == pytest.approx(80.0)
+
+    def test_short_is_paid_when_rate_is_positive(self):
+        """Sign falls out of inventory * rate: no special case needed."""
+        from mmbacktest.sim.engine import _Position
+        p = _Position(inventory=-2.0)
+        p.apply_funding(rate=0.0005, mark_price=80_000.0)
+        assert p.cash == pytest.approx(+80.0)
+        assert p.funding_paid == pytest.approx(-80.0)
+
+    def test_flat_book_pays_nothing(self):
+        from mmbacktest.sim.engine import _Position
+        p = _Position(inventory=0.0)
+        p.apply_funding(rate=0.0005, mark_price=80_000.0)
+        assert p.cash == 0.0
+        assert p.n_funding_events == 1
+
+    @staticmethod
+    def _run_with(funding):
+        from mmbacktest.calibration.intensity import IntensityEstimate
+        from mmbacktest.config import Config
+        from mmbacktest.data.synthetic import generate_mbo_events, generate_trades
+        from mmbacktest.sim.engine import BacktestEngine
+        from mmbacktest.strategy.base import make_quoter
+
+        c = Config()
+        c.simulation.warmup_seconds = 0.0
+        c.strategy.name = "symmetric"
+        c.calibration.vol_min_observations = 5
+        ev = generate_mbo_events(n_events=20_000, seed=3)
+        tr = generate_trades(ev, trade_rate=0.02, seed=3)
+        eng = BacktestEngine(
+            c, make_quoter(c.strategy),
+            IntensityEstimate(A=0.09, kappa=0.04, n_trades=500,
+                              n_buckets_used=6, r_squared=0.8),
+        )
+        return ev, eng.run(ev, tr, progress_every=None, funding=funding)
+
+    def test_settlements_outside_the_window_are_not_counted(self):
+        """The loader widens the window by one interval each side; only
+        settlements the replay clock actually passes may be charged."""
+        from mmbacktest.data.synthetic import generate_mbo_events
+        ev = generate_mbo_events(n_events=20_000, seed=3)
+        t0, t1 = ev["ts_exch"].min(), ev["ts_exch"].max()
+        mid_t = t0 + (t1 - t0) / 2
+        funding = pd.DataFrame({
+            "settles_at": [t0 - pd.Timedelta(hours=1), mid_t,
+                           t1 + pd.Timedelta(hours=1)],
+            "rate": [0.0005, 0.0005, 0.0005],
+            "mark_at_settle": [80_000.0, 80_000.0, 80_000.0],
+        })
+        _, res = self._run_with(funding)
+        assert res.funding_stats["n_funding_events"] == 1
+
+    def test_attribution_sums_with_funding(self):
+        """total = spread + inventory + fees + funding, to the cent.
+
+        Funding is charged to cash during the replay, so it is inside total
+        PnL; if it were not removed from the inventory residual the cost of
+        carrying a position would be booked as mark-to-market.
+        """
+        from mmbacktest.metrics.performance import compute_metrics
+        from mmbacktest.sim.fills import compute_markouts
+        from mmbacktest.data.synthetic import generate_mbo_events
+
+        ev = generate_mbo_events(n_events=20_000, seed=3)
+        t0, t1 = ev["ts_exch"].min(), ev["ts_exch"].max()
+        funding = pd.DataFrame({
+            "settles_at": [t0 + (t1 - t0) * f for f in (0.3, 0.6, 0.9)],
+            "rate": [0.0005, -0.0003, 0.0007],
+            "mark_at_settle": [80_000.0] * 3,
+        })
+        _, res = self._run_with(funding)
+        fills = compute_markouts(res.fills, res.timeline[["ts", "mid"]],
+                                 (100, 1000))
+        m = compute_metrics(res.timeline, fills, res.fill_stats, q_max=10.0,
+                            markout_horizons_ms=(100, 1000),
+                            funding_stats=res.funding_stats)
+
+        assert m.n_funding_events == 3
+        parts = m.pnl_spread_capture + m.pnl_inventory + m.pnl_fees + m.pnl_funding
+        assert parts == pytest.approx(m.total_pnl, abs=1e-6)
+
+    def test_no_schedule_means_not_modelled(self):
+        """Absence must be distinguishable from funding that netted to zero."""
+        _, res = self._run_with(None)
+        assert res.funding_stats["n_funding_events"] == 0
+        assert res.funding_stats["funding_paid"] == 0.0

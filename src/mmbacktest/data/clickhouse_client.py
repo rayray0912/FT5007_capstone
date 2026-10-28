@@ -246,6 +246,52 @@ class MBODataStore:
         logger.info("loaded %s trades", f"{len(df):,}")
         return df
 
+    def load_funding(
+        self,
+        symbol: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> pd.DataFrame:
+        """Settled funding rates for a window, one row per 8h event.
+
+        Backfilled from REST by scripts/backfill_deriv.py rather than written
+        by the collector, which does not subscribe to `status:deriv`.
+
+        The rate charged at a settlement is the last accrued value observed
+        before it, which is what `v_funding` resolves with argMax. Returns an
+        empty frame when the table is absent or the window is not covered;
+        callers must treat that as "funding not modelled" rather than "funding
+        was zero", because the two differ by a cost that scales with position
+        size.
+        """
+        clauses = ["symbol = {symbol:String}"]
+        params: dict[str, object] = {"symbol": symbol}
+        if start is not None:
+            clauses.append("settles_at >= {start:DateTime64(3)}")
+            params["start"] = start
+        if end is not None:
+            clauses.append("settles_at <= {end:DateTime64(3)}")
+            params["end"] = end
+
+        query = f"""
+            SELECT settles_at, rate, mark_at_settle, n_samples
+            FROM v_funding
+            WHERE {' AND '.join(clauses)}
+            ORDER BY settles_at
+        """
+        try:
+            df = self.client.query_df(query, parameters=params)
+        except Exception as exc:  # noqa: BLE001 - absence is a normal state
+            logger.warning(
+                "no funding data available (%s); runs will exclude the "
+                "funding component of inventory cost", exc,
+            )
+            return pd.DataFrame(
+                columns=["settles_at", "rate", "mark_at_settle", "n_samples"]
+            )
+        logger.info("loaded %d funding settlements", len(df))
+        return df
+
     # ------------------------------------------------------------------
     # Data quality
     # ------------------------------------------------------------------

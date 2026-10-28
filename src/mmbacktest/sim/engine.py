@@ -48,6 +48,9 @@ class BacktestResult:
     strategy_name: str
     config: dict
     fill_stats: dict
+    # Empty when the run had no funding schedule, which is distinguishable
+    # from a run where funding netted to zero.
+    funding_stats: dict = field(default_factory=dict)
 
     @property
     def n_fills(self) -> int:
@@ -80,6 +83,8 @@ class _Position:
     inventory: float = 0.0          # contracts, signed
     cash: float = 0.0               # quote currency
     fees_paid: float = 0.0
+    funding_paid: float = 0.0
+    n_funding_events: int = 0
     realised_trades: int = 0
 
     def apply_fill(self, fill: Fill, maker_fee_bps: float) -> None:
@@ -98,8 +103,35 @@ class _Position:
         self.fees_paid += fee
         self.realised_trades += 1
 
+    def apply_funding(self, rate: float, mark_price: float) -> float:
+        """Settle one funding event on the position held at this instant.
+
+        Bitfinex charges funding on the position open at the settlement
+        timestamp, not on a time-weighted average, so this is a point charge
+        rather than an accrual: whatever is held at 00:00, 08:00 and 16:00 UTC
+        pays (or receives) and nothing else matters.
+
+        A positive rate means longs pay shorts. The sign therefore falls out
+        of `inventory * rate` without a special case: a long book with a
+        positive rate pays, a short book with a positive rate is paid.
+
+        Returns the signed charge, positive when we paid.
+        """
+        charge = self.inventory * mark_price * rate
+        self.cash -= charge
+        self.funding_paid += charge
+        self.n_funding_events += 1
+        return charge
+
     def equity(self, mid: float) -> float:
-        """Mark-to-market on the mid."""
+        """Mark-to-market on the mid.
+
+        Deliberately the book mid, not mark price. Mark price exists for
+        margin and liquidation; using it here would mix the venue's own
+        smoothing into the PnL of a strategy whose edge is measured against
+        the touch. Mark price enters only through funding, which is what it
+        actually settles against.
+        """
         return self.cash + self.inventory * mid
 
 
@@ -171,14 +203,35 @@ class BacktestEngine:
         events: pd.DataFrame,
         trades: pd.DataFrame,
         progress_every: int | None = 1_000_000,
+        funding: pd.DataFrame | None = None,
     ) -> BacktestResult:
         """Replay `events`, matching against `trades`.
 
         Both frames must be sorted by timestamp. Trades are merged into the
         event stream by timestamp so the two are processed in true order
         rather than in two passes.
+
+        `funding` is optional and carries one row per 8h settlement, with
+        columns `settles_at`, `rate` and `mark_at_settle` (see
+        MBODataStore.load_funding). Omitting it leaves funding out of the
+        attribution entirely, which is not a neutral choice: the charge
+        scales with position size, so dropping it flatters whichever
+        strategy controls inventory worst.
         """
         merged = self._merge_streams(events, trades)
+        fund_ts, fund_rate, fund_mark = self._funding_schedule(funding)
+
+        # The schedule is loaded with a margin either side of the window, so
+        # it can contain settlements that happened before the replay began.
+        # Those belong to a position we never held: skip them rather than
+        # letting the first event "settle" them. (Inventory is zero at that
+        # point so the charge would be zero, but the event count would not,
+        # and a count that includes settlements outside the window misstates
+        # how many the strategy was actually exposed to.)
+        fund_i = 0
+        if len(merged) and len(fund_ts):
+            first_ts = float(merged["_ts_seconds"].iloc[0])
+            fund_i = int(np.searchsorted(fund_ts, first_ts, side="left"))
         logger.info("replaying %s combined events", f"{len(merged):,}")
 
         decision_dt = self.cfg.simulation.decision_interval_ms / 1000.0
@@ -246,6 +299,19 @@ class BacktestEngine:
                     self.position.apply_fill(f, self.cfg.simulation.maker_fee_bps)
                     self._fills.append(f)
 
+            # Step 3.5: funding settlements that this timestamp has passed.
+            #
+            # Exogenous and point-in-time, so it is applied as soon as the
+            # clock reaches it, before the strategy gets to react. A window
+            # can pass several at once only if events are sparse, hence the
+            # while rather than an if.
+            while fund_i < len(fund_ts) and now >= fund_ts[fund_i]:
+                self.position.apply_funding(
+                    rate=float(fund_rate[fund_i]),
+                    mark_price=float(fund_mark[fund_i]),
+                )
+                fund_i += 1
+
             # Step 4: decision clock.
             mid = self.book.mid
             if mid is None:
@@ -275,6 +341,10 @@ class BacktestEngine:
             strategy_name=self.quoter.name,
             config=self.cfg.to_dict(),
             fill_stats=self.fills_sim.stats(),
+            funding_stats={
+                "funding_paid": self.position.funding_paid,
+                "n_funding_events": self.position.n_funding_events,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -394,6 +464,7 @@ class BacktestEngine:
             "quote_ask": ask_px,
             "n_fills_cum": len(self._fills),
             "fees_paid": self.position.fees_paid,
+            "funding_paid": self.position.funding_paid,
         }
         if state is not None:
             row["sigma"] = state.sigma
@@ -407,6 +478,46 @@ class BacktestEngine:
     # ------------------------------------------------------------------
     # Stream merging
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _funding_schedule(
+        funding: pd.DataFrame | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Settlements as (epoch seconds, rate, mark price), ascending.
+
+        Converted via as_unit("ns") for the same reason the event clock is:
+        `astype("int64")` on a datetime column returns the column's own
+        resolution, and ClickHouse hands these back as datetime64[ms].
+        """
+        empty = (np.empty(0), np.empty(0), np.empty(0))
+        if funding is None or funding.empty:
+            return empty
+
+        need = {"settles_at", "rate", "mark_at_settle"}
+        missing = need - set(funding.columns)
+        if missing:
+            logger.warning("funding frame missing %s; skipping funding", missing)
+            return empty
+
+        f = funding.dropna(subset=["settles_at", "rate", "mark_at_settle"])
+        f = f.sort_values("settles_at")
+        if f.empty:
+            return empty
+
+        ts = pd.to_datetime(f["settles_at"])
+        if isinstance(ts.dtype, pd.DatetimeTZDtype):
+            ts = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+        secs = ts.dt.as_unit("ns").astype("int64").to_numpy() / 1e9
+
+        logger.info(
+            "funding: %d settlements, mean rate %+.5f%%/8h",
+            len(f), float(f["rate"].mean()) * 100.0,
+        )
+        return (
+            secs,
+            f["rate"].to_numpy(dtype=float),
+            f["mark_at_settle"].to_numpy(dtype=float),
+        )
 
     @staticmethod
     def _merge_streams(events: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFrame:

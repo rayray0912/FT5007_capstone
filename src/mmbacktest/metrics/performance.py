@@ -78,6 +78,7 @@ class PerformanceMetrics:
     pnl_inventory: float
     pnl_fees: float
 
+
     # Context
     duration_hours: float
     strategy: str = ""
@@ -101,6 +102,14 @@ class PerformanceMetrics:
     # performance.
     pnl_inventory_gross: float = 0.0
     pnl_inventory_tstat: float = 0.0
+    # Funding is the fourth leg of the attribution and the one specific to a
+    # perpetual. It is charged on the position held at each 8h settlement, so
+    # it scales with inventory: leaving it out does not bias the comparison
+    # neutrally, it flatters whichever strategy controls inventory worst.
+    # Zero with `n_funding_events == 0` means funding was not modelled, which
+    # is a different statement from funding having netted to zero.
+    pnl_funding: float = 0.0
+    n_funding_events: int = 0
 
     # Share of fills on price levels the strategy created rather than joined.
     # Legitimate behaviour -- stepping inside a 15 USD spread is the whole
@@ -166,6 +175,12 @@ class PerformanceMetrics:
             f"spread capture            {self.pnl_spread_capture:>14,.2f}",
             f"inventory MTM             {self.pnl_inventory:>14,.2f}",
             f"fees                      {self.pnl_fees:>14,.2f}",
+            (
+                f"funding ({self.n_funding_events} events)"
+                f"{self.pnl_funding:>{max(1, 26 - len(str(self.n_funding_events)))},.2f}"
+                if self.n_funding_events
+                else "funding                     not modelled"
+            ),
         ]
         return "\n".join(lines)
 
@@ -186,6 +201,7 @@ def compute_metrics(
     q_max: float,
     markout_horizons_ms: tuple[int, ...] = (100, 1000, 5000, 30000),
     strategy: str = "",
+    funding_stats: dict | None = None,
 ) -> PerformanceMetrics:
     """Compute the full metric set from a run's timeline and fills."""
     if timeline.empty:
@@ -324,8 +340,21 @@ def compute_metrics(
     # ---------------------------------------------------------------
 
     fees = float(tl["fees_paid"].iloc[-1]) if "fees_paid" in tl else 0.0
-    # Whatever is not spread capture or fees is inventory mark-to-market.
-    pnl_inventory = total_pnl - pnl_spread_capture + fees
+
+    # Funding was charged to cash during the replay, so it is already inside
+    # total_pnl and has to be taken back out of the residual -- otherwise the
+    # cost of carrying inventory would be attributed to inventory MTM, which
+    # is exactly the term it needs to be distinguished from.
+    fstats = funding_stats or {}
+    pnl_funding = float(
+        fstats.get("funding_paid",
+                   tl["funding_paid"].iloc[-1] if "funding_paid" in tl else 0.0)
+    )
+    n_funding_events = int(fstats.get("n_funding_events", 0))
+
+    # Whatever is not spread capture, fees or funding is inventory
+    # mark-to-market.
+    pnl_inventory = total_pnl - pnl_spread_capture + fees + pnl_funding
 
     # Scale and significance of the position PnL (see the field docs).
     inv_steps = tl["inventory"].to_numpy(dtype=float)[:-1] * np.diff(
@@ -368,6 +397,8 @@ def compute_metrics(
         pnl_inventory_gross=pnl_inventory_gross,
         pnl_inventory_tstat=pnl_inventory_tstat,
         pnl_fees=-fees,
+        pnl_funding=-pnl_funding,
+        n_funding_events=n_funding_events,
         duration_hours=float(duration_h),
         frac_fills_at_new_level=frac_new_level,
         strategy=strategy,
@@ -411,6 +442,7 @@ def compare(results: dict[str, PerformanceMetrics]) -> pd.DataFrame:
         ("  inventory gross", "pnl_inventory_gross", "{:,.0f}"),
         ("  inventory t-stat", "pnl_inventory_tstat", "{:+.2f}"),
         ("PnL: fees", "pnl_fees", "{:,.2f}"),
+        ("PnL: funding", "pnl_funding", "{:,.2f}"),
     ]
 
     data: dict[str, list[str]] = {}
