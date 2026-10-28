@@ -412,12 +412,29 @@ pooled fit describes neither regime.
 2. **Attribute the residual sequence-number gaps** (section 2), which needs the
    collector source, and confirm that it persists `seq_gap` / `checksum_fail`
    rows when those mechanisms fire rather than only logging them.
-3. **Collect the `status:deriv` channel.** Funding rate, mark price and index
-   price are not being captured. For a perpetual, funding is a real component
-   of inventory carrying cost, and its absence means PnL attribution
-   systematically understates the cost of holding inventory. Historical funding
-   can be backfilled over REST but high-frequency mark price cannot, so the
-   loss grows with every day of delay.
+   **Resolved.** The collector source enforces `seq == prev + 1` on the
+   connection-level SEQ_ALL stream and writes `seq_gap` before forcing a
+   resync, so zero `seq_gap` rows over 59 days and 561M rows means the stream
+   never lost a message. The ~104k numbers absent from `book_mbo.seq` on epoch
+   27 are the trades (16,168), heartbeats and per-iteration checksum messages
+   that share the same connection. `checksum_fail` is likewise persisted: it
+   fired for real on 2026-10-08 (9 events across all three symbols in 11 s),
+   and the collector resynced each into a new epoch, so the incident is
+   confined to BTC epoch 127, ETH 132 and XAUT 123.
+3. **Funding: done by backfill, not by changing the collector.** The REST
+   endpoint `/v2/status/deriv/<SYMBOL>/hist` serves ~60s history for the
+   whole collected period when given explicit `start`/`end` (without them it
+   returns only the last few hours, which is what made it look
+   unrecoverable). `scripts/backfill_deriv.py` loads it into
+   `bfx.deriv_status`; the engine charges each 8h settlement on the signed
+   position held at that instant, and attribution carries funding as a
+   fourth leg. On epoch 27 it costs symmetric 1,595 against 433 of spread
+   capture (368%), AS 116 against 586 (20%), GLFT 173 against 622 (28%). The
+   attribution sums exactly: inventory PnL is unchanged by adding it, and
+   total PnL falls by precisely the funding term. Mean settled rates over the
+   backfill: BTC +0.029%, ETH +0.025%, XAUT -0.003% per 8h -- XAUT's funding
+   runs the other way. Adding `status:deriv` to the collector would only buy
+   sub-minute mark price, which nothing here uses.
 4. **Fee sensitivity on the remaining epochs and instruments.** Done for
    epoch 27 (appendix), which corrected the claimed cost of the standard tier
    a second time: measured against *captured* spread rather than quoted
@@ -441,9 +458,11 @@ pooled fit describes neither regime.
 
 ## 6. Open questions for supervision
 
-1. **Funding-rate collection** — worth interrupting the current collector to
-   add the `status:deriv` subscription now, or run a second collector process
-   alongside it to avoid any risk to the existing stream?
+1. ~~**Funding-rate collection**~~ — no longer needs the collector touched:
+   history is backfilled over REST (next steps, item 3). If live collection is
+   wanted later, a restart is safe -- the collector resumes its epoch counter
+   from `max(epoch)` in ClickHouse, so it costs one epoch boundary, and BTC
+   already has 222 of those over 59 days.
 2. **Cross-instrument scope** — is the BTC/ETH/XAUT comparison (with XAUT as a
    non-crypto control) worth the extra work, or is a single instrument done
    thoroughly the better use of the remaining time?

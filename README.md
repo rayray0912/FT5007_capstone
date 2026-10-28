@@ -134,11 +134,13 @@ reported (`fills at self-made level`) rather than assumed away.
 
 ## Known limitations
 
-- **No funding-rate data yet.** The `status:deriv` channel (mark price, index
-  price, funding rate) is not being collected. For a perpetual, funding is a
-  real component of inventory carrying cost, so the current PnL attribution
-  understates the cost of holding inventory. This is the most consequential
-  open gap.
+- **Funding is backfilled, not collected live.** The collector does not
+  subscribe to `status:deriv`; funding and mark price are pulled from
+  Bitfinex REST at ~60s resolution by `scripts/backfill_deriv.py` into
+  `bfx.deriv_status`, and charged in the replay on the signed position held
+  at each 8h settlement. Sub-minute mark price is not recoverable, and
+  nothing here needs it. A run with no funding data says so in its output
+  rather than reporting zero.
 - **Venue is mid-liquidity.** Bitfinex BTC-PERP turns over ~13M USD/24h,
   two to three orders of magnitude below the major venues. Parameters
   calibrated here do not transfer directly to a thick book. This is a scope

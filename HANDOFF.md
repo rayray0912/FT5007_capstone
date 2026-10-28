@@ -155,9 +155,13 @@ collector is still running, so there is more data now. Re-run
 | tXAUTF0:USTF0 | 55.5M | 2,512 | 757:1 |
 
 - ClickHouse TTL is 6 months, so the earliest data expires around 2027-02-28.
-- **Funding rate, mark price and index price are not collected** (`status:deriv`
-  channel). This is the largest data gap. Historical funding can be backfilled
-  over REST; high-frequency mark price cannot.
+- **Funding and mark price are backfilled, not collected live.** The collector
+  does not subscribe to `status:deriv`. `scripts/backfill_deriv.py` pulls
+  `/v2/status/deriv/<SYMBOL>/hist` (~60s resolution; it needs explicit
+  `start`/`end`, otherwise it returns only the last few hours) into
+  `bfx.deriv_status`, with settled rates in the `v_funding` view. Sub-minute
+  mark price is unrecoverable and nothing uses it. Mean settled rate per 8h:
+  BTC +0.029%, ETH +0.025%, XAUT -0.003% (XAUT's runs the other way).
 
 ---
 
@@ -291,8 +295,15 @@ split sample.
 `python scripts/sweep_epochs.py --symbol tETHF0:USTF0 --gamma 0.001` (check the symbol string against `list_epochs`). XAUT's 757:1
 quote-to-trade ratio makes it the external-validity test.
 
-**7. Funding data.** Write a REST backfill for historical funding into a new
-table. **Ask before creating tables** or touching the collector.
+**7. Funding data.** Done (2026-10-28, table creation authorised by the
+user). The engine charges each 8h settlement on the signed position held at
+that instant; attribution carries `PnL: funding` as a fourth leg and the four
+legs sum to total PnL exactly. Funding does not feed back into quoting, so it
+never changes fills, spread capture or inventory paths -- only cash. Runs
+without a funding schedule print "not modelled" rather than zero. Backfill
+coverage is per window: `--full` for a whole symbol, `--epochs-min-hours N` for
+long epochs only. The collector was not touched; a restart would be safe if
+live collection is ever wanted (epoch counter resumes from `max(epoch)`).
 
 **8. Adaptive ladder steps 3–5**, only after 2 and 3 exist:
 - online estimators (Kalman / rolling) for σ, κ and A;
