@@ -115,19 +115,20 @@ def load_data(
     return events, trades, funding, label
 
 
-def calibrate_intensity(
-    cfg: Config, events: pd.DataFrame, trades: pd.DataFrame
-) -> IntensityEstimate:
-    """Fit lambda(delta) on the replay window.
+def _mid_series(
+    events: pd.DataFrame,
+    tick_size: float | None,
+    sample_from: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Reconstruct the book and sample its mid on a 1 s grid.
 
-    The mid series needed to measure trade distance is built by a first pass
-    over the book. That pass is not wasted: it is the same reconstruction the
-    replay will do, so its cost is one extra traversal rather than a separate
-    data product.
+    One second is enough resolution to locate a trade and far cheaper than
+    storing every event. `sample_from` discards samples before a point while
+    still applying every event, which is how a segment that does not begin at
+    a snapshot is warmed up: its book starts empty and fills in from the
+    incremental stream, and its touch is meaningless until it has.
     """
-    logger.info("building mid series for intensity calibration")
-    book = OrderBook(tick_size=cfg.strategy.tick_size)
-
+    book = OrderBook(tick_size=tick_size)
     rows = []
     prev_action = ""
     ts_col = events["ts_exch"].to_numpy()
@@ -138,11 +139,8 @@ def calibrate_intensity(
     amount = events["amount"].to_numpy(dtype=float)
     seq = events["seq"].to_numpy()
 
-    # Sample the mid on a 1s grid: enough resolution to locate a trade, far
-    # cheaper than storing every event.
     next_sample = None
     step = pd.Timedelta(seconds=1)
-
     for i in range(len(events)):
         act = str(action[i]).lower()
         if act == "snapshot" and prev_action != "snapshot":
@@ -155,25 +153,21 @@ def calibrate_intensity(
         if mid is None:
             continue
         ts = pd.Timestamp(ts_col[i])
+        if sample_from is not None and ts < sample_from:
+            continue
         if next_sample is None:
             next_sample = ts
         if ts >= next_sample:
             rows.append({"ts": ts, "mid": mid})
             while next_sample <= ts:
                 next_sample += step
+    return pd.DataFrame(rows)
 
-    mid_series = pd.DataFrame(rows)
-    if mid_series.empty or trades.empty:
-        logger.warning("insufficient data to calibrate intensity; using fallback")
-        return IntensityEstimate(A=0.01, kappa=0.01, n_trades=0,
-                                 n_buckets_used=0, r_squared=0.0)
 
-    with_mid = attach_mid_to_trades(trades, mid_series)
+def _fit(cfg: Config, with_mid: pd.DataFrame) -> IntensityEstimate:
     estimates = estimate_by_session(with_mid, cfg.calibration)
-
-    for label, est in sorted(estimates.items()):
+    for _label, est in sorted(estimates.items()):
         logger.info("  %s", est)
-
     pooled = estimates["all"]
     if not pooled.is_usable:
         logger.warning(
@@ -182,6 +176,122 @@ def calibrate_intensity(
             pooled.kappa, pooled.r_squared,
         )
     return pooled
+
+
+def calibrate_intensity(
+    cfg: Config, events: pd.DataFrame, trades: pd.DataFrame
+) -> IntensityEstimate:
+    """Fit lambda(delta) on the replay window itself (in-sample).
+
+    The mid series needed to measure trade distance is built by a first pass
+    over the book. That pass is not wasted: it is the same reconstruction the
+    replay will do, so its cost is one extra traversal rather than a separate
+    data product.
+
+    In-sample means kappa and A are fitted on the same trades the replay then
+    quotes against. That is identical across strategies, so orderings between
+    them stay fair, but it is a lookahead; see calibrate_walk_forward.
+    """
+    logger.info("building mid series for intensity calibration (in-sample)")
+    mid_series = _mid_series(events, cfg.strategy.tick_size)
+    if mid_series.empty or trades.empty:
+        logger.warning("insufficient data to calibrate intensity; using fallback")
+        return IntensityEstimate(A=0.01, kappa=0.01, n_trades=0,
+                                 n_buckets_used=0, r_squared=0.0)
+    return _fit(cfg, attach_mid_to_trades(trades, mid_series))
+
+
+def calibrate_walk_forward(
+    cfg: Config,
+    replay_start: pd.Timestamp,
+    hours: float,
+    min_coverage: float = 0.5,
+) -> tuple[IntensityEstimate, dict]:
+    """Fit lambda(delta) on the `hours` before the replay starts, and nothing after.
+
+    The window [replay_start - hours, replay_start) usually spans several
+    collector epochs. Each is reconstructed on its own -- a book cannot be
+    replayed across an epoch boundary without ghost orders -- and trades are
+    matched to the mid of their own segment only, so a trade near a gap is
+    never measured against a stale mid from the previous epoch. Compromised
+    epochs are skipped. A segment that begins mid-epoch has no snapshot, so
+    its first `warmup_seconds` are applied to the book but not sampled.
+
+    Raises SystemExit if the window has less than `min_coverage` of its hours
+    covered. It deliberately does not fall back to in-sample: a comparison
+    that silently mixed the two would be worse than one with fewer epochs.
+    """
+    replay_start = pd.Timestamp(replay_start)
+    w1 = replay_start
+    w0 = replay_start - pd.Timedelta(hours=hours)
+    warm = pd.Timedelta(seconds=cfg.simulation.warmup_seconds)
+
+    store = MBODataStore(cfg.clickhouse)
+    segments = []
+    for e in store.list_epochs(cfg.data.symbol, 0.0):
+        s0, s1 = max(pd.Timestamp(e.start), w0), min(pd.Timestamp(e.end), w1)
+        if s1 > s0:
+            segments.append((e, s0, s1))
+    segments.sort(key=lambda x: x[1])
+
+    parts, covered = [], 0.0
+    for e, s0, s1 in segments:
+        at_snapshot = s0 <= pd.Timestamp(e.start)
+        sample_from = s0 if at_snapshot else s0 + warm
+        if sample_from >= s1:
+            continue
+        ev = store.load_book_events(cfg.data.symbol, e.epoch, s0, s1)
+        tr = store.load_trades(cfg.data.symbol, sample_from, s1)
+        # Strictly before the replay: load_trades is inclusive at the end.
+        tr = tr[pd.to_datetime(tr["ts_exch"]) < w1]
+        if ev.empty or tr.empty:
+            continue
+        mid = _mid_series(ev, cfg.strategy.tick_size, sample_from=sample_from)
+        if mid.empty:
+            continue
+        parts.append(attach_mid_to_trades(tr, mid))
+        covered += (s1 - sample_from).total_seconds() / 3600.0
+    store.close()
+
+    meta = {
+        "mode": "walk_forward",
+        "hours": hours,
+        "window_start": str(w0),
+        "window_end": str(w1),
+        "covered_hours": round(covered, 3),
+        "n_segments": len(parts),
+    }
+    if not parts or covered < min_coverage * hours:
+        raise SystemExit(
+            f"walk-forward calibration: only {covered:.1f} h of the {hours:g} h "
+            f"before {w1} are covered ({len(parts)} usable segments); need at "
+            f"least {min_coverage:.0%}. Not falling back to in-sample."
+        )
+
+    logger.info(
+        "walk-forward calibration: %s -> %s, %.1f h covered in %d segment(s)",
+        w0, w1, covered, len(parts),
+    )
+    est = _fit(cfg, pd.concat(parts, ignore_index=True))
+    meta.update({"kappa": est.kappa, "A": est.A, "r_squared": est.r_squared,
+                 "n_trades": est.n_trades, "usable": est.is_usable})
+    return est, meta
+
+
+def calibrate(
+    cfg: Config, args, events: pd.DataFrame, trades: pd.DataFrame
+) -> tuple[IntensityEstimate, dict]:
+    """Dispatch on --calibration and return the estimate with its provenance."""
+    mode = getattr(args, "calibration", "in_sample")
+    if mode == "walk_forward":
+        if args.synthetic:
+            raise SystemExit("walk-forward calibration needs real data")
+        start = pd.to_datetime(events["ts_exch"]).min()
+        return calibrate_walk_forward(cfg, start, args.calib_hours)
+    est = calibrate_intensity(cfg, events, trades)
+    return est, {"mode": "in_sample", "kappa": est.kappa, "A": est.A,
+                 "r_squared": est.r_squared, "n_trades": est.n_trades,
+                 "usable": est.is_usable}
 
 
 # --------------------------------------------------------------------------
@@ -229,7 +339,7 @@ def cmd_run(args, cfg: Config) -> int:
     if args.no_funding:
         logger.info("--no-funding: funding excluded from this run")
         funding = pd.DataFrame()
-    intensity = calibrate_intensity(cfg, events, trades)
+    intensity, calib_meta = calibrate(cfg, args, events, trades)
 
     metrics, result = run_one(
         cfg, events, trades, intensity, cfg.strategy.name, funding=funding
@@ -241,7 +351,8 @@ def cmd_run(args, cfg: Config) -> int:
     print(metrics.summary())
 
     if args.out:
-        _write_outputs(Path(args.out), {cfg.strategy.name: metrics}, result, provenance)
+        _write_outputs(Path(args.out), {cfg.strategy.name: metrics}, result,
+                       provenance, calibration=calib_meta)
     return 0
 
 
@@ -252,7 +363,7 @@ def cmd_compare(args, cfg: Config) -> int:
     if args.no_funding:
         logger.info("--no-funding: funding excluded from this run")
         funding = pd.DataFrame()
-    intensity = calibrate_intensity(cfg, events, trades)
+    intensity, calib_meta = calibrate(cfg, args, events, trades)
 
     strategies = ["symmetric", "avellaneda_stoikov", "glft"]
     fee_levels = [float(f) for f in args.fees.split(",")]
@@ -278,8 +389,8 @@ def cmd_compare(args, cfg: Config) -> int:
 
     print()
     print(f"data: {provenance}")
-    print(f"intensity: A={intensity.A:.6f} kappa={intensity.kappa:.6f} "
-          f"R2={intensity.r_squared:.3f}")
+    print(f"intensity ({calib_meta.get('mode')}): A={intensity.A:.6f} "
+          f"kappa={intensity.kappa:.6f} R2={intensity.r_squared:.3f}")
     print()
     print(table.to_string())
 
@@ -315,7 +426,8 @@ def cmd_compare(args, cfg: Config) -> int:
         )
 
     if args.out:
-        _write_outputs(Path(args.out), all_metrics, last_result, provenance, table)
+        _write_outputs(Path(args.out), all_metrics, last_result, provenance, table,
+                       calibration=calib_meta)
     return 0
 
 
@@ -324,13 +436,15 @@ def cmd_compare(args, cfg: Config) -> int:
 # --------------------------------------------------------------------------
 
 def _write_outputs(out_dir: Path, metrics: dict, result, provenance: str,
-                   table: pd.DataFrame | None = None) -> None:
+                   table: pd.DataFrame | None = None,
+                   calibration: dict | None = None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "data_provenance": provenance,
+        "calibration": calibration or {},
         "metrics": {k: v.to_dict() for k, v in metrics.items()},
     }
     (out_dir / f"metrics_{stamp}.json").write_text(json.dumps(payload, indent=2))
@@ -366,6 +480,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="override maker fee, negative for a rebate")
     p.add_argument("--no-queue-model", action="store_true",
                    help="disable queue-position fills (for the queue sensitivity study)")
+    p.add_argument("--calibration", choices=["in_sample", "walk_forward"],
+                   default="in_sample",
+                   help="fit kappa/A on the replay window itself (in_sample) or "
+                        "only on the hours before it (walk_forward)")
+    p.add_argument("--calib-hours", type=float, default=24.0,
+                   help="walk-forward look-back; 24 h covers each session once")
     p.add_argument("--no-funding", action="store_true",
                    help="leave funding out even where it was backfilled, to "
                         "reproduce results from before the deriv backfill")

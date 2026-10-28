@@ -19,6 +19,7 @@ this sweep is not a walk-forward evaluation.
 from __future__ import annotations
 
 import argparse
+import shlex
 import subprocess
 import sys
 import time
@@ -41,6 +42,12 @@ def main() -> int:
                     help="epoch 0 may be internally discontinuous; excluded by default")
     ap.add_argument("--out", default="results/sweep")
     ap.add_argument("--config", default="config/default.yaml")
+    ap.add_argument("--epochs", default=None,
+                    help="comma-separated epoch list; overrides --min-minutes. "
+                         "Use it to re-run exactly the epochs of an earlier sweep.")
+    ap.add_argument("--cli-args", default="",
+                    help="extra global CLI arguments, e.g. "
+                         "'--calibration walk_forward --no-funding'")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -54,7 +61,17 @@ def main() -> int:
         print("no usable epochs found (is Tailscale up?)", file=sys.stderr)
         return 1
 
-    if not args.include_epoch0:
+    if args.epochs:
+        wanted = {int(x) for x in args.epochs.split(",") if x.strip()}
+        store = MBODataStore(cfg.clickhouse)
+        pool = store.list_epochs(args.symbol, 0.0, exclude_compromised=False)
+        store.close()
+        epochs = [e for e in pool if e.epoch in wanted]
+        missing = wanted - {e.epoch for e in epochs}
+        if missing:
+            print(f"requested epochs not found: {sorted(missing)}", file=sys.stderr)
+            return 1
+    elif not args.include_epoch0:
         epochs = [e for e in epochs if e.epoch != 0]
     # Shortest first: early failures surface quickly, and partial results
     # cover many epochs rather than a few long ones.
@@ -86,6 +103,7 @@ def main() -> int:
             "--epoch", str(e.epoch),
             "--gamma", str(args.gamma),
             "--out", str(edir),
+            *shlex.split(args.cli_args),
             "compare", "--fees", args.fees,
         ]
         t0 = time.time()

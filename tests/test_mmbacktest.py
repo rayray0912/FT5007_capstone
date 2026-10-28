@@ -1179,3 +1179,49 @@ class TestFlashMoveQuoteHygiene:
             n += 1
         assert n > 3000
         assert q.n_sides_suppressed == 0
+
+
+class TestWalkForwardCalibration:
+    """Offline parts of walk-forward calibration (the window logic needs
+    ClickHouse and is exercised on real data)."""
+
+    def test_warmup_samples_are_dropped_but_events_still_applied(self):
+        """A segment without a snapshot is warmed up: every event reaches the
+        book, but mids before `sample_from` are not sampled. The book state
+        after warm-up must equal a full replay's -- otherwise the warm-up would
+        be skipping data rather than just not observing it."""
+        from mmbacktest.cli import _mid_series
+        from mmbacktest.data.synthetic import generate_mbo_events
+
+        ev = generate_mbo_events(n_events=20_000, seed=5)
+        cut = ev["ts_exch"].iloc[len(ev) // 2]
+        full = _mid_series(ev, 1.0)
+        warm = _mid_series(ev, 1.0, sample_from=cut)
+
+        assert not warm.empty and (warm["ts"] >= cut).all()
+        later = full[full["ts"] >= warm["ts"].iloc[0]].reset_index(drop=True)
+        n = min(len(later), len(warm))
+        assert np.allclose(later["mid"].iloc[:n], warm["mid"].iloc[:n])
+
+    def test_walk_forward_refuses_synthetic_data(self):
+        """There is no history before a synthetic stream; this must fail
+        loudly rather than quietly calibrating in-sample."""
+        import argparse
+        from mmbacktest.cli import calibrate
+        from mmbacktest.config import Config
+
+        args = argparse.Namespace(calibration="walk_forward", synthetic=True,
+                                  calib_hours=24.0)
+        with pytest.raises(SystemExit):
+            calibrate(Config(), args, pd.DataFrame(), pd.DataFrame())
+
+    def test_in_sample_is_still_the_default_and_is_labelled(self):
+        import argparse
+        from mmbacktest.cli import calibrate
+        from mmbacktest.config import Config
+        from mmbacktest.data.synthetic import generate_mbo_events, generate_trades
+
+        ev = generate_mbo_events(n_events=20_000, seed=5)
+        tr = generate_trades(ev, trade_rate=0.02, seed=5)
+        _, meta = calibrate(Config(), argparse.Namespace(synthetic=True), ev, tr)
+        assert meta["mode"] == "in_sample"
