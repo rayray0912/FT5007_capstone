@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from ..calibration.intensity import IntensityEstimate
+from ..calibration.intensity import IntensityEstimate, IntensitySchedule
 from ..calibration.volatility import RollingVolatility
 from ..config import Config
 from ..data.book import OrderBook, _is_bid
@@ -178,11 +178,15 @@ class BacktestEngine:
         self,
         cfg: Config,
         quoter: Quoter,
-        intensity: IntensityEstimate,
+        intensity: IntensityEstimate | IntensitySchedule,
     ):
         self.cfg = cfg
         self.quoter = quoter
+        # A schedule switches kappa/A at the session boundaries; a single
+        # estimate holds for the whole replay.
         self.intensity = intensity
+        self._n_decisions = 0
+        self._n_intensity_fallback = 0
 
         self.book = OrderBook(tick_size=cfg.strategy.tick_size)
         self.fills_sim = FillSimulator(cfg.simulation)
@@ -361,6 +365,8 @@ class BacktestEngine:
                 "n_sides_suppressed": int(
                     getattr(self.quoter, "n_sides_suppressed", 0)
                 ),
+                "n_decisions": self._n_decisions,
+                "n_intensity_fallback": self._n_intensity_fallback,
             },
         )
 
@@ -393,6 +399,13 @@ class BacktestEngine:
             self._record(now, mid, None, None)
             return
 
+        if isinstance(self.intensity, IntensitySchedule):
+            est, fell_back = self.intensity.at(now)
+            self._n_intensity_fallback += fell_back
+        else:
+            est = self.intensity
+        self._n_decisions += 1
+
         state = MarketState(
             ts_seconds=now,
             mid=mid,
@@ -401,10 +414,10 @@ class BacktestEngine:
             microprice=book.microprice or mid,
             imbalance=book.imbalance(),
             sigma=self.vol.sigma,
-            kappa=self.intensity.kappa,
+            kappa=est.kappa,
             # GLFT's A is an arrival intensity, not the fitted density.
             # See IntensityEstimate.arrival_intensity.
-            A=self.intensity.arrival_intensity,
+            A=est.arrival_intensity,
             inventory=self.position.inventory,
             time_remaining=horizon,
         )

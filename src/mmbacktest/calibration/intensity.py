@@ -133,17 +133,47 @@ class IntensityEstimate:
         )
 
 
+def _label_for_hour(h: int, boundaries: tuple[int, ...]) -> str:
+    edges = sorted(boundaries)
+    lo = max((b for b in edges if b <= h), default=edges[-1])
+    idx = edges.index(lo)
+    hi = edges[idx + 1] if idx + 1 < len(edges) else edges[0] + 24
+    return f"{lo:02d}-{hi % 24:02d}"
+
+
 def session_of(ts: pd.Series, boundaries: tuple[int, ...]) -> pd.Series:
     """Map timestamps to a session label from UTC-hour boundaries."""
+    table = [_label_for_hour(h, boundaries) for h in range(24)]
     hours = pd.to_datetime(ts).dt.hour
-    edges = sorted(boundaries)
-    labels = []
-    for h in hours:
-        lo = max((b for b in edges if b <= h), default=edges[-1])
-        idx = edges.index(lo)
-        hi = edges[idx + 1] if idx + 1 < len(edges) else edges[0] + 24
-        labels.append(f"{lo:02d}-{hi % 24:02d}")
-    return pd.Series(labels, index=ts.index if hasattr(ts, "index") else None)
+    return pd.Series([table[h] for h in hours],
+                     index=ts.index if hasattr(ts, "index") else None)
+
+
+def session_exposure_seconds(
+    coverage: list[tuple[pd.Timestamp, pd.Timestamp]],
+    boundaries: tuple[int, ...],
+) -> dict[str, float]:
+    """Seconds of observed wall-clock time falling in each session.
+
+    `coverage` is the list of intervals the calibration trades were drawn
+    from. A rate is trades over the time the market was *observed*, and a
+    session's share of that time is only hours/24 when the window is whole
+    days with no gaps. A 3 h in-sample epoch covers one or two sessions, not
+    a 1/8 slice of each; a walk-forward window loses the gaps between
+    epochs. Splitting the intervals at hour boundaries gets both right.
+    """
+    table = [_label_for_hour(h, boundaries) for h in range(24)]
+    out: dict[str, float] = {}
+    hour = pd.Timedelta(hours=1)
+    for start, end in coverage:
+        t = pd.Timestamp(start)
+        end = pd.Timestamp(end)
+        while t < end:
+            nxt = min(t.floor("h") + hour, end)
+            label = table[t.hour]
+            out[label] = out.get(label, 0.0) + (nxt - t).total_seconds()
+            t = nxt
+    return out
 
 
 def attach_mid_to_trades(
@@ -247,12 +277,19 @@ def estimate_intensity(
 def estimate_by_session(
     trades_with_mid: pd.DataFrame,
     cfg: CalibrationConfig,
+    coverage: list[tuple[pd.Timestamp, pd.Timestamp]] | None = None,
 ) -> dict[str, IntensityEstimate]:
     """Fit one intensity model per session bucket.
 
     Returns a dict keyed by session label, always including an "all" key with
     the unconditional fit so the stratified and pooled estimates can be
     compared directly.
+
+    With `coverage`, each session's rate is divided by the time actually
+    observed in it (see session_exposure_seconds). Without it, a session is
+    assumed to hold hours/24 of the trade span, which is only right for whole
+    days. The pooled "all" fit keeps the trade span either way, so passing
+    coverage leaves it unchanged.
     """
     df = trades_with_mid.dropna(subset=["delta", "mid"]).copy()
     out: dict[str, IntensityEstimate] = {}
@@ -266,17 +303,59 @@ def estimate_by_session(
     if not cfg.stratify_by_session:
         return out
 
+    exposure = (session_exposure_seconds(coverage, cfg.session_boundaries_utc)
+                if coverage else None)
     df["session"] = session_of(df["ts_exch"], cfg.session_boundaries_utc)
     for label, grp in df.groupby("session"):
         # Duration for a session is the share of wall-clock time that session
         # covers, not the span of its trades: a session with few trades still
         # occupied its full share of the window, and dividing by the trade
         # span would inflate its rate.
-        hours_in_session = _session_hours(label)
-        seconds = total_seconds * hours_in_session / 24.0
+        if exposure is not None:
+            seconds = exposure.get(label, 0.0)
+        else:
+            seconds = total_seconds * _session_hours(label) / 24.0
         out[label] = estimate_intensity(grp, cfg, max(seconds, 1.0), label)
 
     return out
+
+
+class IntensitySchedule:
+    """Intensity parameters that switch at the UTC session boundaries.
+
+    The engine asks for the estimate in force at each decision. A session
+    whose fit is unusable (or that had no trades in the calibration window)
+    falls back to the pooled fit rather than to a guess, and the caller is
+    told so: a session result that quietly ran on the pooled numbers half
+    the time would be a static result with a different label.
+    """
+
+    def __init__(self, estimates: dict[str, IntensityEstimate],
+                 boundaries: tuple[int, ...]):
+        self.pooled = estimates["all"]
+        self.estimates = estimates
+        self.boundaries = tuple(boundaries)
+        self._label = [_label_for_hour(h, self.boundaries) for h in range(24)]
+        self.fallback_sessions = sorted({
+            lb for lb in self._label
+            if lb not in estimates or not estimates[lb].is_usable
+        })
+        self._est: list[IntensityEstimate] = []
+        self._fallback: list[bool] = []
+        for lb in self._label:
+            est = estimates.get(lb)
+            ok = est is not None and est.is_usable
+            self._est.append(est if ok else self.pooled)
+            self._fallback.append(not ok)
+
+    def at(self, ts_seconds: float) -> tuple[IntensityEstimate, bool]:
+        """(estimate in force at a UTC epoch-seconds time, whether it fell back)."""
+        h = int(ts_seconds // 3600) % 24
+        return self._est[h], self._fallback[h]
+
+    def __str__(self) -> str:
+        fb = f", pooled fallback for {self.fallback_sessions}" if self.fallback_sessions else ""
+        return f"session schedule over {len(set(self._label))} sessions{fb}"
 
 
 # --------------------------------------------------------------------------

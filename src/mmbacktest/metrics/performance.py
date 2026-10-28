@@ -120,6 +120,10 @@ class PerformanceMetrics:
     # because a high count would mean the result depends on that hygiene rule.
     n_sides_suppressed: int = 0
 
+    # Under session intensity, the share of decisions that ran on the pooled
+    # fit because their session's own fit was unusable. 0 for static runs.
+    frac_decisions_intensity_fallback: float = 0.0
+
     # Share of fills on price levels the strategy created rather than joined.
     # Legitimate behaviour -- stepping inside a 15 USD spread is the whole
     # point of quoting -- but those fills are the ones the replay models
@@ -410,6 +414,10 @@ def compute_metrics(
         pnl_funding=-pnl_funding,
         n_funding_events=n_funding_events,
         n_sides_suppressed=int((quote_stats or {}).get("n_sides_suppressed", 0)),
+        frac_decisions_intensity_fallback=(
+            (quote_stats or {}).get("n_intensity_fallback", 0)
+            / max((quote_stats or {}).get("n_decisions", 0), 1)
+        ),
         duration_hours=float(duration_h),
         frac_fills_at_new_level=frac_new_level,
         strategy=strategy,

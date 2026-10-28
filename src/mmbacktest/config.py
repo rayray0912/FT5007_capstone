@@ -208,6 +208,11 @@ class CalibrationConfig:
     stratify_by_session: bool = True
     session_boundaries_utc: tuple[int, ...] = (0, 6, 9, 13, 17, 21)
 
+    # Whether the engine *uses* the per-session fits. Off by default: the
+    # estimates above have always been computed and logged, but quotes were
+    # built on the pooled "all" fit, and every result so far assumes that.
+    session_intensity: bool = False
+
 
 # --------------------------------------------------------------------------
 # Strategy

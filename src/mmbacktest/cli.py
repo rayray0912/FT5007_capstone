@@ -28,8 +28,10 @@ import pandas as pd
 
 from .calibration.intensity import (
     IntensityEstimate,
+    IntensitySchedule,
     attach_mid_to_trades,
     estimate_by_session,
+    session_exposure_seconds,
 )
 from .config import Config
 from .data.book import OrderBook, _is_bid
@@ -164,8 +166,18 @@ def _mid_series(
     return pd.DataFrame(rows)
 
 
-def _fit(cfg: Config, with_mid: pd.DataFrame) -> IntensityEstimate:
-    estimates = estimate_by_session(with_mid, cfg.calibration)
+def _fit(
+    cfg: Config,
+    with_mid: pd.DataFrame,
+    coverage: list[tuple[pd.Timestamp, pd.Timestamp]],
+) -> tuple[IntensityEstimate | IntensitySchedule, dict]:
+    """Fit pooled and per-session intensity; return what the engine should use.
+
+    Returns the pooled estimate, or a session schedule when
+    `calibration.session_intensity` is set, plus metadata for the output JSON.
+    """
+    estimates = estimate_by_session(with_mid, cfg.calibration, coverage)
+    exposure = session_exposure_seconds(coverage, cfg.calibration.session_boundaries_utc)
     for _label, est in sorted(estimates.items()):
         logger.info("  %s", est)
     pooled = estimates["all"]
@@ -175,12 +187,28 @@ def _fit(cfg: Config, with_mid: pd.DataFrame) -> IntensityEstimate:
             "quotes will fall back to the volatility term only",
             pooled.kappa, pooled.r_squared,
         )
-    return pooled
+    meta = {"kappa": pooled.kappa, "A": pooled.A, "r_squared": pooled.r_squared,
+            "n_trades": pooled.n_trades, "usable": pooled.is_usable,
+            "session_intensity": cfg.calibration.session_intensity,
+            "sessions": {
+                lb: {"kappa": e.kappa, "A": e.A, "r_squared": e.r_squared,
+                     "n_trades": e.n_trades, "usable": e.is_usable,
+                     "exposure_hours": round(exposure.get(lb, 0.0) / 3600, 3)}
+                for lb, e in sorted(estimates.items()) if lb != "all"
+            }}
+    if not cfg.calibration.session_intensity:
+        return pooled, meta
+    if not cfg.calibration.stratify_by_session:
+        raise SystemExit("session_intensity needs stratify_by_session")
+    schedule = IntensitySchedule(estimates, cfg.calibration.session_boundaries_utc)
+    logger.info("intensity: %s", schedule)
+    meta["fallback_sessions"] = schedule.fallback_sessions
+    return schedule, meta
 
 
 def calibrate_intensity(
     cfg: Config, events: pd.DataFrame, trades: pd.DataFrame
-) -> IntensityEstimate:
+) -> tuple[IntensityEstimate | IntensitySchedule, dict]:
     """Fit lambda(delta) on the replay window itself (in-sample).
 
     The mid series needed to measure trade distance is built by a first pass
@@ -196,9 +224,13 @@ def calibrate_intensity(
     mid_series = _mid_series(events, cfg.strategy.tick_size)
     if mid_series.empty or trades.empty:
         logger.warning("insufficient data to calibrate intensity; using fallback")
-        return IntensityEstimate(A=0.01, kappa=0.01, n_trades=0,
-                                 n_buckets_used=0, r_squared=0.0)
-    return _fit(cfg, attach_mid_to_trades(trades, mid_series))
+        est = IntensityEstimate(A=0.01, kappa=0.01, n_trades=0,
+                                n_buckets_used=0, r_squared=0.0)
+        return est, {"kappa": est.kappa, "A": est.A, "r_squared": 0.0,
+                     "n_trades": 0, "usable": False}
+    ts = pd.to_datetime(events["ts_exch"])
+    return _fit(cfg, attach_mid_to_trades(trades, mid_series),
+                [(ts.min(), ts.max())])
 
 
 def calibrate_walk_forward(
@@ -234,7 +266,7 @@ def calibrate_walk_forward(
             segments.append((e, s0, s1))
     segments.sort(key=lambda x: x[1])
 
-    parts, covered = [], 0.0
+    parts, coverage, covered = [], [], 0.0
     for e, s0, s1 in segments:
         at_snapshot = s0 <= pd.Timestamp(e.start)
         sample_from = s0 if at_snapshot else s0 + warm
@@ -250,6 +282,7 @@ def calibrate_walk_forward(
         if mid.empty:
             continue
         parts.append(attach_mid_to_trades(tr, mid))
+        coverage.append((sample_from, s1))
         covered += (s1 - sample_from).total_seconds() / 3600.0
     store.close()
 
@@ -272,9 +305,8 @@ def calibrate_walk_forward(
         "walk-forward calibration: %s -> %s, %.1f h covered in %d segment(s)",
         w0, w1, covered, len(parts),
     )
-    est = _fit(cfg, pd.concat(parts, ignore_index=True))
-    meta.update({"kappa": est.kappa, "A": est.A, "r_squared": est.r_squared,
-                 "n_trades": est.n_trades, "usable": est.is_usable})
+    est, fit_meta = _fit(cfg, pd.concat(parts, ignore_index=True), coverage)
+    meta.update(fit_meta)
     return est, meta
 
 
@@ -288,10 +320,8 @@ def calibrate(
             raise SystemExit("walk-forward calibration needs real data")
         start = pd.to_datetime(events["ts_exch"]).min()
         return calibrate_walk_forward(cfg, start, args.calib_hours)
-    est = calibrate_intensity(cfg, events, trades)
-    return est, {"mode": "in_sample", "kappa": est.kappa, "A": est.A,
-                 "r_squared": est.r_squared, "n_trades": est.n_trades,
-                 "usable": est.is_usable}
+    est, meta = calibrate_intensity(cfg, events, trades)
+    return est, {"mode": "in_sample", **meta}
 
 
 # --------------------------------------------------------------------------
@@ -389,8 +419,10 @@ def cmd_compare(args, cfg: Config) -> int:
 
     print()
     print(f"data: {provenance}")
-    print(f"intensity ({calib_meta.get('mode')}): A={intensity.A:.6f} "
-          f"kappa={intensity.kappa:.6f} R2={intensity.r_squared:.3f}")
+    pooled = getattr(intensity, "pooled", intensity)
+    print(f"intensity ({calib_meta.get('mode')}): A={pooled.A:.6f} "
+          f"kappa={pooled.kappa:.6f} R2={pooled.r_squared:.3f}"
+          + (f"  [{intensity}]" if pooled is not intensity else ""))
     print()
     print(table.to_string())
 
@@ -486,6 +518,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "only on the hours before it (walk_forward)")
     p.add_argument("--calib-hours", type=float, default=24.0,
                    help="walk-forward look-back; 24 h covers each session once")
+    p.add_argument("--session-intensity", action="store_true",
+                   help="switch kappa/A at the UTC session boundaries instead "
+                        "of quoting on the pooled fit all day")
     p.add_argument("--no-funding", action="store_true",
                    help="leave funding out even where it was backfilled, to "
                         "reproduce results from before the deriv backfill")
@@ -518,6 +553,8 @@ def apply_overrides(cfg: Config, args) -> Config:
         cfg.simulation.maker_fee_bps = args.maker_fee_bps
     if args.no_queue_model:
         cfg.simulation.use_queue_model = False
+    if args.session_intensity:
+        cfg.calibration.session_intensity = True
     if getattr(args, "strategy", None):
         cfg.strategy.name = args.strategy
     return cfg

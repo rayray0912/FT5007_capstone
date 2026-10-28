@@ -1225,3 +1225,140 @@ class TestWalkForwardCalibration:
         tr = generate_trades(ev, trade_rate=0.02, seed=5)
         _, meta = calibrate(Config(), argparse.Namespace(synthetic=True), ev, tr)
         assert meta["mode"] == "in_sample"
+
+
+class TestSessionIntensity:
+    """kappa/A switching at UTC session boundaries (HANDOFF item 3)."""
+
+    B = (0, 6, 9, 13, 17, 21)
+
+    @staticmethod
+    def _est(kappa, A=0.09, r2=0.8, session="all"):
+        from mmbacktest.calibration.intensity import IntensityEstimate
+        return IntensityEstimate(A=A, kappa=kappa, n_trades=500,
+                                 n_buckets_used=6, r_squared=r2, session=session)
+
+    def test_exposure_splits_at_hour_boundaries(self):
+        """A 05:30-09:30 window is 0.5 h of 00-06, 3 h of 06-09 and 0.5 h of
+        09-13 -- not a 1/8 share of each session, which is what the hours/24
+        convention would assign to a 4 h window."""
+        from mmbacktest.calibration.intensity import session_exposure_seconds
+        t0 = pd.Timestamp("2026-09-05 05:30")
+        exp = session_exposure_seconds([(t0, t0 + pd.Timedelta(hours=4))], self.B)
+        assert exp == {"00-06": 1800.0, "06-09": 10800.0, "09-13": 1800.0}
+
+    def test_exposure_wraps_midnight_and_sums_gaps_out(self):
+        from mmbacktest.calibration.intensity import session_exposure_seconds
+        cov = [(pd.Timestamp("2026-09-05 22:00"), pd.Timestamp("2026-09-06 01:00")),
+               (pd.Timestamp("2026-09-06 02:00"), pd.Timestamp("2026-09-06 03:00"))]
+        exp = session_exposure_seconds(cov, self.B)
+        assert exp == {"21-00": 7200.0, "00-06": 7200.0}
+
+    def test_coverage_changes_session_rates_but_not_the_pooled_fit(self):
+        """Passing coverage must leave the pooled estimate -- the one every
+        static result uses -- bit-identical."""
+        from mmbacktest.calibration.intensity import estimate_by_session
+        from mmbacktest.config import CalibrationConfig
+        rng = np.random.default_rng(0)
+        n = 20_000
+        ts = pd.Timestamp("2026-09-05 00:00") + pd.to_timedelta(
+            np.sort(rng.uniform(0, 4 * 3600, n)), unit="s")
+        df = pd.DataFrame({"ts_exch": ts, "mid": 100_000.0,
+                           "delta": rng.exponential(10.0, n)})
+        cfg = CalibrationConfig()
+        a = estimate_by_session(df, cfg)
+        b = estimate_by_session(df, cfg, [(ts.min(), ts.max())])
+        assert a["all"] == b["all"]
+        # 4 h inside 00-06: hours/24 assigns it 1 h of exposure, the true
+        # figure is 4 h, so the session rate (A) must fall by ~4x.
+        assert b["00-06"].kappa == pytest.approx(a["00-06"].kappa)
+        assert b["00-06"].A == pytest.approx(a["00-06"].A / 4, rel=1e-3)
+
+    def test_schedule_maps_hours_including_the_wrap(self):
+        from mmbacktest.calibration.intensity import IntensitySchedule
+        ests = {"all": self._est(0.10)}
+        for i, lb in enumerate(["00-06", "06-09", "09-13", "13-17", "17-21", "21-00"]):
+            ests[lb] = self._est(0.01 * (i + 1), session=lb)
+        s = IntensitySchedule(ests, self.B)
+        day = pd.Timestamp("2026-09-05").timestamp()
+        for hour, kappa in [(0, .01), (5, .01), (6, .02), (12, .03), (13, .04),
+                            (20, .05), (21, .06), (23, .06)]:
+            est, fb = s.at(day + hour * 3600 + 59.9)
+            assert est.kappa == pytest.approx(kappa) and not fb, hour
+        assert s.fallback_sessions == []
+
+    def test_unusable_or_missing_session_falls_back_to_pooled_and_says_so(self):
+        from mmbacktest.calibration.intensity import IntensitySchedule
+        ests = {"all": self._est(0.10), "00-06": self._est(0.02, r2=0.1),
+                "06-09": self._est(0.03)}
+        s = IntensitySchedule(ests, self.B)
+        day = pd.Timestamp("2026-09-05").timestamp()
+        assert s.at(day + 3600) == (ests["all"], True)      # unusable fit
+        assert s.at(day + 7 * 3600) == (ests["06-09"], False)
+        assert s.at(day + 15 * 3600) == (ests["all"], True)  # no fit at all
+        assert s.fallback_sessions == ["00-06", "09-13", "13-17", "17-21", "21-00"]
+
+    def _run(self, intensity, name="avellaneda_stoikov", shift=None):
+        from mmbacktest.config import Config
+        from mmbacktest.data.synthetic import generate_mbo_events, generate_trades
+        from mmbacktest.sim.engine import BacktestEngine
+        from mmbacktest.strategy.base import make_quoter
+        c = Config()
+        c.strategy.name = name
+        c.strategy.gamma = 0.01
+        c.calibration.vol_min_observations = 5
+        c.simulation.warmup_seconds = 0.0   # the synthetic stream is 5 min
+        ev = generate_mbo_events(n_events=20_000, seed=3)
+        tr = generate_trades(ev, trade_rate=0.02, seed=3)
+        if shift is not None:
+            ev["ts_exch"] += shift
+            tr["ts_exch"] += shift
+        return BacktestEngine(c, make_quoter(c.strategy), intensity).run(
+            ev, tr, progress_every=None)
+
+    def _all_sessions(self, kappa, r2=0.8):
+        from mmbacktest.calibration.intensity import IntensitySchedule
+        ests = {"all": self._est(0.04)}
+        for lb in ["00-06", "06-09", "09-13", "13-17", "17-21", "21-00"]:
+            ests[lb] = self._est(kappa, r2=r2, session=lb)
+        return IntensitySchedule(ests, self.B)
+
+    @pytest.mark.parametrize("name", ["avellaneda_stoikov", "glft"])
+    def test_engine_quotes_on_the_session_estimate(self, name):
+        """With every session set to kappa=0.02, a schedule run must equal a
+        static run at kappa=0.02, and differ from the pooled kappa=0.04."""
+        sched = self._run(self._all_sessions(0.02), name)
+        static_same = self._run(self._est(0.02), name)
+        static_pooled = self._run(self._est(0.04), name)
+        pd.testing.assert_frame_equal(sched.timeline, static_same.timeline)
+        assert not sched.timeline.equals(static_pooled.timeline)
+        assert sched.quote_stats["n_intensity_fallback"] == 0
+        assert sched.quote_stats["n_decisions"] > 0
+
+    def test_all_sessions_unusable_reproduces_the_static_run(self):
+        sched = self._run(self._all_sessions(0.02, r2=0.1))
+        static = self._run(self._est(0.04))
+        pd.testing.assert_frame_equal(sched.timeline, static.timeline)
+        qs = sched.quote_stats
+        assert qs["n_intensity_fallback"] == qs["n_decisions"] > 0
+
+    def test_kappa_switches_at_the_boundary(self):
+        """Stream shifted to straddle 06:00 UTC, 00-06 at kappa=0.02 and
+        06-09 at 0.06: up to 06:00 the run must match a static 0.02 run
+        exactly, and after it must not."""
+        from mmbacktest.calibration.intensity import IntensitySchedule
+        ests = {"all": self._est(0.04), "00-06": self._est(0.02, session="00-06"),
+                "06-09": self._est(0.06, session="06-09")}
+        shift = pd.Timedelta(hours=5, minutes=57, seconds=30)
+        sched = self._run(IntensitySchedule(ests, self.B), shift=shift)
+        static = self._run(self._est(0.02), shift=shift)
+        edge = pd.Timestamp("2026-09-01 06:00")
+        before_s = sched.timeline[sched.timeline["ts"] < edge]
+        before_t = static.timeline[static.timeline["ts"] < edge]
+        assert len(before_s) > 100
+        pd.testing.assert_frame_equal(before_s, before_t)
+        after_s = sched.timeline[sched.timeline["ts"] >= edge].reset_index(drop=True)
+        after_t = static.timeline[static.timeline["ts"] >= edge].reset_index(drop=True)
+        assert len(after_s) > 100 and not after_s.equals(after_t)
+        # 09-13 etc. are absent, but the stream never reaches them.
+        assert sched.quote_stats["n_intensity_fallback"] == 0
