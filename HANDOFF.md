@@ -1,182 +1,380 @@
-# Handoff to Claude Code
+# Handoff
 
 Paste the **Opening prompt** below into a fresh Claude Code session in the repo
-root. Everything else here is reference for you, not for pasting.
+root. Everything after it is reference material for that session.
+
+Last updated: 2026-10-28. Supersedes the 2026-09-28 version: the 62-epoch γ
+sweep has been run since then, and its results change several statements the
+old file made (see "What the sweep established").
 
 ---
 
 ## Opening prompt
 
-> I'm working on my NUS FT5007 capstone: a market-making backtest on
-> order-level Bitfinex perpetual data, implementing GLFT against classical
-> baselines. The repo is built but has never been run against the real
-> dataset — only synthetic data.
+> I'm working on my NUS FT5007 capstone (supervisor: Asst. Prof. Lu Yao). It's
+> a market-making backtest on order-level (MBO) Bitfinex perpetual data that
+> compares GLFT against symmetric and Avellaneda–Stoikov baselines. On top of
+> that I'm designing an adaptive parameter-control layer.
 >
-> Read `docs/progress_report.md` and `README.md` first. They cover the current
-> state, what's implemented, what's broken, and what was learned building it.
-> Then read `src/mmbacktest/config.py`, which documents most of the non-obvious
-> modelling decisions inline.
+> Read `HANDOFF.md` in full first. Then read `docs/progress_report.md`
+> (section 3 matters most) and `src/mmbacktest/config.py`, which documents the
+> non-obvious modelling decisions inline.
 >
-> The immediate task is to get a first real run working. The data lives in
-> ClickHouse on a NUC reachable over Tailscale at 100.76.49.84:8123, database
-> `bfx`. Start with `python scripts/audit_data.py` and we'll work from
-> whatever it reports.
+> State of play: the pipeline runs on real data, and a 3-γ × 62-epoch BTC sweep
+> is complete. The results are in `results/sweep/summary_epochs.csv`;
+> `python scripts/aggregate_sweep.py` reproduces the sign tests. The next work
+> is listed in priority order under "Work queue" in HANDOFF.md.
+>
+> You have the shell on my Mac, which reaches ClickHouse on my NUC over
+> Tailscale. Work through the queue yourself: run things, read the outputs,
+> fix what's broken, and commit in small, well-described commits on a branch
+> (never on main). Stop and ask me before anything irreversible, such as
+> dropping or altering ClickHouse tables, changing the collector on the NUC,
+> force-pushing, or deleting results.
 >
 > Things I care about: don't invent numbers, don't claim something ran if it
-> didn't, and tell me when a result looks too good rather than reporting it.
-> An earlier version of this project reported a +2% annualised return that had
-> to be retracted because the fill model was too permissive — I'd rather catch
-> that kind of thing early.
+> didn't, and tell me when a result looks too good. This project has already
+> had to retract a +2% annualised result, and later caught +475% and +40%
+> results that were inventory noise. A small run that's understood beats a
+> large one that isn't.
 
 ---
 
-## Where the project actually stands
+## 1. Environment
 
-**Built and tested (28 unit tests passing):** order-level book
-reconstruction, intensity and volatility calibration, three quoting strategies
-(symmetric / Avellaneda-Stoikov / GLFT), queue-position-aware fill simulation,
-backtest engine on a 100ms clock, metrics layer, CLI.
+### Paths and machines
 
-**Never run on real data.** Every number produced so far is from the synthetic
-generator, which has no informed flow. Behavioural metrics from it are
-informative; PnL is not.
+| What | Where |
+|---|---|
+| Repo (Mac) | `/Users/rayhe/Desktop/NUS_Capstone/code/FT5007_capstone` |
+| Working branch | `fix/real-data-first-run` (last commit `0c1d907`) |
+| Remote | `github.com/rayray0912/FT5007_capstone` |
+| Python env | conda env `FT5007` (`scripts/run_sweep.sh` activates it); a `.venv` also works, see below |
+| Data | ClickHouse on the NUC, `100.76.49.84:8123` over Tailscale, database `bfx` |
+| Tables | `bfx.book_mbo` (order-level book events), plus trades; see `docs/dataset.md` |
+| Collector | `bfx-mbo-collector` on the NUC (Singapore), running since 2026-08-30 06:29 UTC |
 
-**Not started:** the LLM-adaptive layer. Prompt and memory schemas are
-designed, no skill code written. This is deliberate — an adaptive layer on top
-of an unvalidated baseline produces a comparison nobody can interpret.
+ClickHouse is reachable **only** from the Mac, or anything else on the tailnet.
+A cloud sandbox cannot reach it, which is why this work moves to a Claude Code
+session on the Mac.
 
----
-
-## First session plan
+### Setup (has cost time twice)
 
 ```bash
-# 1. Confirm the collector is reachable and the data is intact
-python scripts/audit_data.py
-
-# 2. Short pilot on one epoch before committing to a long replay
-python scripts/run_backtest.py --symbol tBTCF0:USTF0 --epoch <N> \
-    run --strategy glft
-
-# 3. The run that matters
-python scripts/run_backtest.py --symbol tBTCF0:USTF0 \
-    compare --fees 0,8,-1 --out results/
-
-# 4. Queue-model sensitivity — see below for why this is the priority
-python scripts/run_backtest.py --symbol tBTCF0:USTF0 \
-    --no-queue-model compare --fees 0 --out results/no_queue/
+conda activate FT5007            # or:
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install pyarrow scipy        # neither is in requirements.txt; cli writes parquet, aggregate uses scipy
 ```
 
-### Why step 4 matters most
+**Local HTTP proxies break the ClickHouse connection.** `clickhouse_connect`
+uses urllib3, which honours `HTTP_PROXY`/`HTTPS_PROXY`. A proxy has no route to
+a tailnet address. Check reachability with the proxy bypassed first, then
+exempt the host:
 
-The difference between runs 3 and 4 quantifies, on real data, how much a
-conventional backtest overstates this strategy. That is a methodological
-finding, not a performance claim, which makes it the most defensible number
-the project will produce for a while. It also directly substantiates the
-earlier retraction of the +2% result.
+```bash
+curl --noproxy '*' -sS "http://100.76.49.84:8123/?query=SELECT%20version()"
+export NO_PROXY="100.76.49.84,localhost,127.0.0.1"; export no_proxy="$NO_PROXY"
+```
 
----
+`MBODataStore.ping()` swallows every exception and reports "cannot reach
+ClickHouse", so a missing import and a real network failure look the same.
+Check the import before blaming the network.
 
-## Traps that will bite
+Add both of these to `requirements.txt` as the first commit:
+`pyarrow`, `scipy`.
 
-**Scale.** 115M book events. The sandbox testing was on 40k. Start with a
-2–4 hour epoch. If it's unusably slow the bottleneck is almost certainly the
-Python loop in `OrderBook.apply()`; profile before optimising, and be
-suspicious of any speedup that changes results.
+### Smoke test before anything else
 
-**Epoch boundaries.** Replays must stay inside one epoch. Crossing one produces
-ghost orders — orders whose delete message fell into a collection gap and which
-therefore never leave the reconstructed book. `resolve_epoch()` handles this,
-but any new query needs the same constraint.
+```bash
+python scripts/run_backtest.py --epoch 27 --gamma 0.001 --out /tmp/smoke compare --fees 0
+```
 
-**Schema drift.** The ClickHouse client was written against the documented
-schema and has never touched the live database. Column names, dtypes, and the
-`side` / `action` enum encodings are the likely first failures. They'll be
-obvious and quick.
+Expected on BTC epoch 27: κ ≈ 0.104627, 16,168 trades in the window. A
+different κ means the data or calibration changed. Find out which before going
+further.
 
-**Config defaults are crypto-scale now.** Three were originally equity-scale
-and wrong by two orders of magnitude. If you ever run this on an equity book,
-`intensity_max_delta_bps`, the half-spread bounds, and `horizon_seconds` all
-need revisiting. Reasoning is inline in `config.py`.
+### Tests
 
-**Trade side convention.** `_merge_streams` assumes Bitfinex signs trade
-`amount` by the aggressor's direction (positive = buy aggressor). Worth
-verifying against real data — if it's inverted, every fill routes to the wrong
-side and adverse selection flips sign.
+```bash
+pytest -q          # 54 test functions; all must pass before and after every change
+```
 
 ---
 
-## Open items, roughly in priority order
+## 2. Repo map
 
-1. **Funding rate collection.** The `status:deriv` channel (funding rate, mark
-   price, index price) isn't being collected. For a perpetual, funding is a
-   real component of inventory carrying cost, so PnL attribution currently
-   understates it. Historical funding backfills over REST; high-frequency mark
-   price does not, so the loss grows daily. This is the most consequential gap.
-2. First real run + queue-model sensitivity (above).
-3. Session-stratified calibration on real data — the dataset has a 3.7x
-   intraday swing in event rate, and the code supports stratification but it's
-   never been exercised on anything but synthetic.
-4. LLM-adaptive layer, only after the baseline is validated.
+```
+src/mmbacktest/
+  config.py                 all parameters; bitfinex_tick_size(); session boundaries (0,6,9,13,17,21 UTC)
+  cli.py                    `run` / `compare`; single --epoch; calibrates κ, A in-sample on that epoch
+  data/clickhouse_client.py MBODataStore, list_epochs, resolve_epoch (epoch-scoped queries)
+  data/book.py              MBO order book reconstruction (OrderBook.apply is the hot loop)
+  data/synthetic.py         synthetic generator, rescaled to the measured market
+  calibration/intensity.py  λ(δ)=A·exp(−κδ) fit; estimate_by_session() exists but is NOT wired into the engine
+  calibration/volatility.py σ estimation
+  strategy/{symmetric,avellaneda_stoikov,glft}.py, base.py (_finalise: clamp, tick-round, bound suppression)
+  sim/engine.py             100 ms decision clock, 80 ms quote latency, quote persistence
+  sim/fills.py              queue-position-aware fills
+  metrics/performance.py    spread capture, inventory variance, PnL attribution, inventory t-stat, fill provenance
+scripts/
+  audit_data.py             dataset integrity audit
+  sweep_epochs.py           resumable per-epoch sweep (one subprocess per epoch, DONE markers)
+  aggregate_sweep.py        → results/sweep/summary_epochs.csv + paired sign tests + γ-effect table
+  run_sweep.sh              launches γ ∈ {1e-4, 1e-3, 1e-2} in parallel (nohup + caffeinate)
+docs/progress_report.md     current written results; section 3 says what survives scrutiny
+docs/dataset.md             schema, collection, integrity
+config/default.yaml         default config (note: gamma 0.1, q_max 10, horizon_seconds 60)
+```
 
----
+**Uncommitted right now:** `scripts/sweep_epochs.py`, `scripts/aggregate_sweep.py`,
+`scripts/run_sweep.sh`, and this file. First commit:
 
-## Useful follow-up prompts
+```bash
+git add scripts/sweep_epochs.py scripts/aggregate_sweep.py scripts/run_sweep.sh HANDOFF.md
+git commit -m "feat(scripts): resumable epoch sweep and cross-epoch sign tests; refresh handoff"
+```
 
-**After audit_data.py runs:**
-> Here's the audit output: [paste]. Pick an epoch for a pilot run and tell me
-> why that one.
-
-**When the first real run fails:**
-> [paste traceback]. Fix it, but first tell me whether this is a schema
-> mismatch or a logic error — I want to know if the code was wrong or just
-> untested against reality.
-
-**After the first successful comparison:**
-> Walk me through these results as if I'll have to defend them. Which numbers
-> would you challenge if you were my supervisor, and what's the honest answer?
-
-**For the queue-model sensitivity:**
-> Compare results/ and results/no_queue/ and write the finding up as three or
-> four sentences I could put in a progress report. Just the difference and what
-> it means — no speculation about what it implies for the strategy.
-
-**Before adding the LLM layer:**
-> Read the prompt and memory schema notes in docs/progress_report.md and
-> `src/mmbacktest/strategy/base.py`. Propose how the two LLM skills should
-> slot into the existing Quoter interface without touching the execution path,
-> and tell me what could go wrong.
-
-**Performance work:**
-> Profile a replay over a 2-hour epoch and show me where the time goes before
-> changing anything. I want to see the profile, not a guess.
+`results/` holds about 555 runs. Check `.gitignore` before adding any of it.
+Commit `summary_epochs.csv` only, not the per-epoch timelines.
 
 ---
 
-## Standing instructions worth repeating
+## 3. Dataset
 
-These are the things that matter for research integrity on this project:
+Collected since 2026-08-30. As of 2026-09-28: 261.6M book events over 29.1
+days, 0 sequence gaps, 0 checksum failures, 275 clean resyncs. Usable segments
+of at least 2 h: 184 in total (BTC 62, ETH 63, XAUT 59). 1,095,785 trades. The
+collector is still running, so there is more data now. Re-run
+`scripts/audit_data.py` for current numbers; don't reuse these.
 
-- **Don't invent numbers.** If something wasn't run, say it wasn't run.
-- **Flag results that look too good.** The project already had to retract a
-  +2% annualised figure because the fill model was too permissive. The failure
-  mode is a plausible-looking number that nobody questions.
-- **Distinguish "the code is wrong" from "the code was never tested here".**
-  Different fixes, different implications.
-- **Prefer a small run that's understood to a large one that isn't.**
+| | book events | trades/day | quote:trade |
+|---|---:|---:|---:|
+| tBTCF0:USTF0 | 124.9M | 19,250 | 222:1 |
+| tETHF0:USTF0 | 80.9M | 15,766 | 176:1 |
+| tXAUTF0:USTF0 | 55.5M | 2,512 | 757:1 |
+
+- ClickHouse TTL is 6 months, so the earliest data expires around 2027-02-28.
+- **Funding rate, mark price and index price are not collected** (`status:deriv`
+  channel). This is the largest data gap. Historical funding can be backfilled
+  over REST; high-frequency mark price cannot.
 
 ---
 
-## Context you may need to explain
+## 4. What the sweep established (real numbers)
 
-**Instrument selection.** The target is BTC / ETH / XAUT perpetuals on
-Bitfinex. HYPE-PERP was dropped at selection for liquidity (~13,675 USD/24h,
-too few trades to calibrate fill intensity). Some earlier project documents
-still reference HYPE — the code and data are correct, those documents predate
-the change.
+Sweep settings: BTC, all usable epochs (epoch 0 excluded), γ ∈ {1e-4, 1e-3,
+1e-2}, zero fees, κ and A calibrated **in-sample** on each epoch. 61 epochs at
+γ=1e-4 (epoch 68 failed, see §6), 62 at the other two. Paired binomial sign
+tests across epochs. Reproduce with `python scripts/aggregate_sweep.py`.
 
-**The retracted result.** An earlier iteration reported +2% annualised at a
-zero-fee sweep optimum. Two causes: the sweep summary didn't net inventory
-carrying cost against trading revenue, and the fill model treated quotes as
-unconditionally filled rather than conditional on queue position. The current
-codebase fixes the second properly; the first is why PnL attribution is now
-reported as a separate metric group.
+### 4.1 Behavioural ordering vs symmetric: robust
+
+| | AS > SYM | GLFT > SYM |
+|---|---|---|
+| spread capture, γ=1e-3 | 60/62, p=8.5e-16 | 61/62, p=2.7e-17 |
+| inventory variance (lower), γ=1e-3 | 61/62, p=2.7e-17 | 61/62, p=2.7e-17 |
+| at γ=1e-2 | 60–62/62 on every metric | 61–62/62 on every metric |
+| at γ=1e-4 | 58/61 on every metric | 58–60/61 |
+
+What used to be a four-epoch anecdote is now a 62-epoch result.
+
+### 4.2 γ is a monotone risk dial (median across epochs)
+
+| strategy | γ | spread capture (bps) | inventory variance | mean abs inventory | fills |
+|---|---|---:|---:|---:|---:|
+| AS | 1e-4 | 1.028 | 0.753 | 1.198 | 799 |
+| AS | 1e-3 | 1.308 | 0.165 | 0.401 | 517 |
+| AS | 1e-2 | 2.119 | 0.026 | 0.099 | 163 |
+| GLFT | 1e-4 | 1.029 | 0.724 | 0.975 | 806 |
+| GLFT | 1e-3 | 1.195 | 0.317 | 0.575 | 706 |
+| GLFT | 1e-2 | 1.456 | 0.121 | 0.297 | 484 |
+| SYM | any | 0.719 | 3.83 | 2.53 | ~1,358 |
+
+Raising γ buys capture per unit and lower inventory, paid for in fill count
+(AS loses 80% of its fills from 1e-4 to 1e-2). GLFT reacts much less to γ than
+AS does.
+
+### 4.3 AS vs GLFT: the ordering flips with γ
+
+- γ=1e-4: GLFT beats AS on capture in 42 of 61 epochs (p=0.0044) and on
+  inventory variance in 44 of 61 (p=7e-4).
+- γ=1e-3 and γ=1e-2: AS beats GLFT on both, in 48–60 of 62 epochs.
+
+So "AS > GLFT" is **not** a property of the models. The same γ means different
+things in the two closed forms, so comparing them at equal γ is not a fair
+comparison. The fair comparison is at **matched inventory variance**: interpolate
+each model's (γ → inventory variance) curve and compare spread capture at
+equal risk. The old handoff's "AS > GLFT > symmetric" should not be repeated
+without this caveat.
+
+### 4.4 PnL: still noise in magnitude, but a possible sign effect
+
+- `pnl_inventory_tstat`: |t| ≥ 1.96 in 3.1% of the 555 runs, which is below
+  the 5% expected under the null. Total PnL remains uninterpretable, and the
+  "PnL is not the metric" argument stands.
+- **New, needs checking:** for AS and GLFT at γ ≥ 1e-3, inventory PnL is
+  negative in 41–45 of 62 epochs (p between 5e-4 and 0.015). Symmetric sits at
+  33/62 (p=0.7), and γ=1e-4 is about 50/50. The skewed quoters seem to lose on
+  inventory *systematically*, even though each single epoch is
+  insignificant. Adverse selection is the obvious candidate. Test it before
+  saying it anywhere: is the effect concentrated in high-σ epochs, does it
+  survive splitting into first and second halves, and does it appear on ETH?
+  The 9 tests share epochs, so they are not independent. Bonferroni at 9 still
+  leaves the γ=1e-2 result (p=5e-4) standing.
+- Total PnL > 0 in only 24–28 of 62 epochs for AS/GLFT at γ ≥ 1e-3.
+- 91–92% of fills land on price levels the strategy created, for every
+  strategy. See trap §6.4.
+
+### 4.5 From earlier single-epoch work (still valid, still narrow)
+
+- κ across 4 BTC epochs spanning up, flat and down markets: 0.0915 / 0.0918 /
+  0.1046 / 0.0940, R² 0.72–0.86.
+- Session-stratified κ on epoch 27: 0.0955–0.1218, a 28% spread across the day.
+  This is **one epoch**, R² falls when the sample is split, and the 17–21 UTC
+  bucket is flagged as too thin. Treat it as a lead.
+- The epoch-27 apparent results (GLFT +40.62%, Sharpe 8.66) and epoch-22
+  (symmetric +475.58%, Sharpe 11.87) are inventory noise.
+
+---
+
+## 5. Work queue (priority order)
+
+Each item says what "done" means. Commit after each one.
+
+**0. Housekeeping.** Commit the scripts (see §2), add `pyarrow` and `scipy`
+to requirements, and confirm `pytest -q` passes.
+
+**1. Fix the epoch-68 crash.** AS at γ=1e-4 on epoch 68 (29.4 h) raises
+`ValueError: tick size undefined for price -58595.1` in
+`bitfinex_tick_size`. Cause: `_finalise` clamps the half-spread but not the
+reservation price. With weak inventory control, `r = s − q·γ·σ²·τ` can go
+below zero. Fix it in `strategy/base.py::_finalise`, applied identically to
+all strategies: bound |r − mid| to a configured maximum skew (in bps, added to
+`config.py` with an inline rationale), or suppress the side when the price is
+non-positive. Add a regression test that feeds an extreme inventory and σ.
+Then re-run `python scripts/sweep_epochs.py --gamma 0.0001` (it resumes and
+only runs epoch 68) and re-aggregate. Log how often the clamp fires; if it
+fires often, that is a finding.
+*Done =* 62/62 at all three γ, the test is added, and the clamp-hit count is
+reported.
+
+**2. Walk-forward calibration.** The CLI calibrates κ and A on the same epoch
+it replays, which is in-sample. Add a mode that calibrates on the preceding
+N hours (or the preceding epoch), using only data before the replay window.
+Re-run γ=1e-3 under it and compare with §4. The behavioural ordering should
+survive; if it doesn't, stop and tell me.
+*Done =* `--calibration {in_sample,walk_forward}` flag, default unchanged,
+and a comparison table.
+
+**3. Wire session-stratified κ/A into the engine.**
+`estimate_by_session()` already returns per-session estimates; the engine uses
+only `"all"`. Make `MarketState.kappa` and `A` switch at the UTC session
+boundaries, behind a config flag, using walk-forward estimates from item 2.
+Run static vs session on all BTC epochs for AS and GLFT at γ=1e-3, then sign
+test. This is ladder step 2 and fills the right-hand table of slide 12. Either
+result can be reported: a gain supports the intraday-structure claim, and no
+gain motivates online estimation.
+*Done =* the paired table and sign tests in `results/session/`.
+
+**4. Matched-risk AS vs GLFT.** Add γ points (for example 3e-4, 3e-3, 3e-2) and
+compare spread capture at equal inventory variance (see §4.3).
+*Done =* one figure of capture vs inventory variance per strategy, with the
+epoch-level spread shown.
+
+**5. Investigate the inventory-PnL sign effect (§4.4).** Look at it
+conditioned on σ, the trend over the epoch, and session; check markouts at
+100 ms, 1 s, 5 s and 30 s. Don't report it as a finding until it holds on a
+split sample.
+
+**6. Cross-instrument.** Repeat the sweep on ETH (63 epochs) and XAUT (59).
+`python scripts/sweep_epochs.py --symbol tETHF0:USTF0 --gamma 0.001` (check the symbol string against `list_epochs`). XAUT's 757:1
+quote-to-trade ratio makes it the external-validity test.
+
+**7. Funding data.** Write a REST backfill for historical funding into a new
+table. **Ask before creating tables** or touching the collector.
+
+**8. Adaptive ladder steps 3–5**, only after 2 and 3 exist:
+- online estimators (Kalman / rolling) for σ, κ and A;
+- a contextual bandit over parameter tiers (γ, q_max, size, spread floor), with
+  reward = spread capture − λ·inventory variance, not PnL;
+- a γ PI controller that holds inventory variance at a target;
+- a Jev event layer for text only, evaluated against a rule tree on the same
+  inputs.
+
+Every step is compared against the previous step, paired by epoch.
+
+---
+
+## 6. Traps
+
+1. **Epoch boundaries.** Replays must stay inside one epoch. Crossing one
+   creates ghost orders whose delete message fell into a gap. `resolve_epoch()`
+   handles this, but every new query needs the same constraint.
+2. **Epoch 0 may be internally discontinuous.** It comes from collector
+   restarts on 2026-08-30. The sweep excludes it by default. To verify the
+   others:
+   ```sql
+   SELECT epoch, max(gap_sec) AS worst_gap_sec, count() AS n_gaps FROM (
+     SELECT epoch, dateDiff('second',
+       lagInFrame(ts_exch) OVER (PARTITION BY epoch ORDER BY ts_exch, seq), ts_exch) AS gap_sec
+     FROM bfx.book_mbo WHERE symbol = 'tBTCF0:USTF0')
+   WHERE gap_sec > 5 GROUP BY epoch ORDER BY worst_gap_sec DESC LIMIT 10
+   ```
+3. **Total PnL is noise.** Never headline PnL or Sharpe. Always show them next to
+   `pnl_inventory_tstat`. The CLI warns when an inventory-dominated result has
+   |t| < 2.
+4. **Fills on self-created levels (~91%).** These are legitimate in a replay,
+   but they assume the quote did not change the flow that hit it, and a
+   replay can't test that. Say so wherever fill-based numbers appear.
+5. **Markouts are non-monotonic in horizon** (GLFT ep27: +1.574 bps at 100 ms,
+   −1.202 at 1 s, +0.108 at 5 s, +4.384 at 30 s). Always name the horizon.
+6. **Equal γ is not equal risk across models** (§4.3).
+7. **Scale.** Long epochs take 6–10 min per γ. The bottleneck is
+   `OrderBook.apply()`. Profile before optimising, and distrust any speedup
+   that changes results. Check the results are bit-identical before and after.
+8. **`config/default.yaml` has γ=0.1**, outside the swept range. Always pass
+   `--gamma` explicitly.
+9. **Zero fees throughout.** Maker fees enter as a constant per fill. Run
+   `--fees` as a sensitivity check only after the behavioural results are settled.
+10. **Mac sleep.** `run_sweep.sh` uses `caffeinate`. Long runs launched any
+    other way need it too.
+
+---
+
+## 7. Presentation and report status
+
+- The Second Interim deck exists, and so does a bilingual script (EN/ZH).
+- **Slide 12's γ table currently holds illustrative placeholder values, which
+  are wrong.** Replace them with §4.2. The real inventory variances are much
+  lower at high γ (AS 0.026, not 0.39), which shows why placeholders must
+  never be presented. Slide 12's right-hand table stays as placeholders until
+  work item 3 is done; then remove the "ILLUSTRATIVE" labels.
+- `docs/progress_report.md` predates the sweep. Update section 3 with §4.1–4.4
+  once items 1–2 are done.
+- Questions for the supervisor:
+  - reframe RQ1 around intraday structure rather than market regimes;
+  - adopt spread capture and inventory variance as the primary metrics.
+
+---
+
+## 8. Standing instructions
+
+- Don't invent numbers. If something didn't run, say so.
+- Flag results that look too good. The failure mode here is a plausible number
+  that nobody questions.
+- Separate "the code is wrong" from "the code was never tested here".
+- Separate behavioural findings, which can be defended, from performance
+  findings, which currently can't be.
+- Small, understood runs before large ones.
+- Small commits on a branch, with messages that say what changed and why.
+  Never commit to main, never force-push.
+
+## Context
+
+- **Instruments:** BTC, ETH and XAUT perpetuals on Bitfinex. HYPE was dropped
+  for liquidity; older documents that mention it predate that change.
+- **The retracted result:** an earlier iteration reported +2% annualised at a
+  zero-fee optimum. There were two causes: inventory carrying cost was not
+  netted, and fills were treated as unconditional. Both are why the metrics
+  layer now attributes PnL and the fill model is queue-aware.
