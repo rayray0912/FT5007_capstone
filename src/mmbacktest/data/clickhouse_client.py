@@ -104,7 +104,12 @@ class MBODataStore:
             """
         )
 
-    def list_epochs(self, symbol: str, min_minutes: float = 0.0) -> list[EpochInfo]:
+    def list_epochs(
+        self,
+        symbol: str,
+        min_minutes: float = 0.0,
+        exclude_compromised: bool = True,
+    ) -> list[EpochInfo]:
         """Contiguous segments for a symbol, longest first.
 
         A segment is one `epoch` value. Because the collector persists its
@@ -127,10 +132,17 @@ class MBODataStore:
         if df.empty:
             return []
 
+        # Epochs with a logged seq_gap or checksum_fail are dropped by default:
+        # the book may have drifted inside them, and every other epoch is
+        # unaffected because the collector resyncs on either.
+        bad = self.compromised_epochs(symbol) if exclude_compromised else set()
+        if bad:
+            logger.info("%s: excluding compromised epochs %s", symbol, sorted(bad))
+
         out: list[EpochInfo] = []
         for row in df.itertuples(index=False):
             minutes = (row.seg_end - row.seg_start).total_seconds() / 60.0
-            if minutes < min_minutes:
+            if minutes < min_minutes or int(row.epoch) in bad:
                 continue
             out.append(
                 EpochInfo(
@@ -152,7 +164,12 @@ class MBODataStore:
         segment above the minimum-length threshold, which gives the run the
         most continuous replay available.
         """
-        epochs = self.list_epochs(data_cfg.symbol, data_cfg.min_epoch_minutes)
+        # Auto-selection never picks a compromised epoch; an explicitly named
+        # one is still allowed (the caller is warned by the integrity check).
+        epochs = self.list_epochs(
+            data_cfg.symbol, data_cfg.min_epoch_minutes,
+            exclude_compromised=data_cfg.epoch is None,
+        )
         if not epochs:
             raise ValueError(
                 f"no epoch for {data_cfg.symbol} longer than "
@@ -317,11 +334,51 @@ class MBODataStore:
             parameters=params,
         )
 
-    def integrity_ok(self, symbol: str | None = None) -> tuple[bool, str]:
-        """Boolean gate on the two failure modes that invalidate a replay."""
-        df = self.audit(symbol)
-        if df.empty:
-            return False, "no collector events recorded"
+    def compromised_epochs(self, symbol: str) -> set[int]:
+        """Epochs in which the collector logged a seq_gap or checksum_fail.
+
+        The collector resyncs into a new epoch when either fires, so an
+        incident is confined to the epoch it happened in and every other epoch
+        is unaffected. (On 2026-10-08 checksum failures hit all three symbols
+        within 11 s; the damage is BTC epoch 127, ETH 132, XAUT 123 and
+        nothing else.)
+        """
+        df = self.client.query_df(
+            """
+            SELECT DISTINCT epoch FROM collector_events
+            WHERE symbol = {symbol:String}
+              AND kind IN ('seq_gap', 'checksum_fail')
+            """,
+            parameters={"symbol": symbol},
+        )
+        return {int(e) for e in df["epoch"]} if not df.empty else set()
+
+    def integrity_ok(
+        self, symbol: str | None = None, epoch: int | None = None
+    ) -> tuple[bool, str]:
+        """Boolean gate on the two failure modes that invalidate a replay.
+
+        Pass `epoch` to ask about the window actually being replayed. Without
+        it the answer covers every epoch of the symbol, and a single incident
+        anywhere in the dataset makes every run look suspect -- which is what
+        happened after 2026-10-08, when each run warned about a drifted book
+        regardless of which epoch it replayed.
+        """
+        if epoch is not None and symbol is not None:
+            df = self.client.query_df(
+                """
+                SELECT kind, count() AS n FROM collector_events
+                WHERE symbol = {symbol:String} AND epoch = {epoch:UInt32}
+                GROUP BY kind
+                """,
+                parameters={"symbol": symbol, "epoch": epoch},
+            )
+            if df.empty:
+                return False, f"no collector events recorded for epoch {epoch}"
+        else:
+            df = self.audit(symbol)
+            if df.empty:
+                return False, "no collector events recorded"
 
         counts = dict(zip(df["kind"], df["n"]))
         gaps = int(counts.get("seq_gap", 0))

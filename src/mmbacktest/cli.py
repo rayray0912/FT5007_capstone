@@ -69,15 +69,16 @@ def load_data(
             "Is Tailscale up? Use --synthetic to develop offline."
         )
 
-    ok, detail = store.integrity_ok(cfg.data.symbol)
-    if not ok:
-        logger.warning("data integrity check failed: %s", detail)
-        logger.warning("proceeding, but the replay may be built on a drifted book")
-    else:
-        logger.info("data integrity: %s", detail)
-
     epoch = store.resolve_epoch(cfg.data)
     logger.info("using %s", epoch)
+
+    ok, detail = store.integrity_ok(cfg.data.symbol, epoch.epoch)
+    if not ok:
+        logger.warning("data integrity check failed for epoch %d: %s",
+                       epoch.epoch, detail)
+        logger.warning("proceeding, but the replay may be built on a drifted book")
+    else:
+        logger.info("data integrity (epoch %d): %s", epoch.epoch, detail)
 
     # Trades must span exactly the same window as the book events. Falling
     # back to the epoch bounds when the config narrows the window loads trades
