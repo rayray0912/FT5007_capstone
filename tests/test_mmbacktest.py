@@ -1060,3 +1060,122 @@ class TestFunding:
         _, res = self._run_with(None)
         assert res.funding_stats["n_funding_events"] == 0
         assert res.funding_stats["funding_paid"] == 0.0
+
+
+class TestFlashMoveQuoteHygiene:
+    """Quotes after a flash move inflates sigma.
+
+    Regression for the epoch-68 crash. BTC-PERP spiked from 81,200 to 153,960
+    and back in ~1.5 s on 2026-09-20 16:28:12 (real trades, not a book
+    artefact). Realised sigma over the 300 s window rose to ~12,300 USD/sqrt(s)
+    against a normal ~8, so AS's skew q*gamma*sigma^2*tau put the raw bid at
+    -58,595 with only 0.154 contracts held, and the tick lookup raised on a
+    negative price. The state below is the one captured at the crash.
+    """
+
+    CRASH = dict(mid=81_299.0, best_bid=81_290.0, best_ask=81_308.0,
+                 sigma=12_301.59, inventory=0.1540278600000016,
+                 kappa=0.0674, A=0.0696)
+
+    def _state(self, **over):
+        p = {**self.CRASH, **over}
+        return MarketState(
+            ts_seconds=1.0, mid=p["mid"], best_bid=p["best_bid"],
+            best_ask=p["best_ask"], microprice=p["mid"], imbalance=0.0,
+            sigma=p["sigma"], kappa=p["kappa"], A=p["A"],
+            inventory=p["inventory"], time_remaining=60.0,
+        )
+
+    def test_crash_state_no_longer_raises(self):
+        q = AvellanedaStoikovQuoter(StrategyConfig(name="avellaneda_stoikov",
+                                                   gamma=1e-4, tick_size=None))
+        quote = q.compute(self._state())
+        # Long and skewing hard: the near (ask) side is pinned to the touch,
+        # the bid -- non-positive -- is not quoted at all.
+        assert quote.bid_price is None and quote.bid_size == 0.0
+        assert quote.ask_price == pytest.approx(81_291.0)
+        assert q.n_sides_suppressed == 1
+
+    def test_short_side_mirror_needs_no_suppression(self):
+        """Short inventory pushes the reservation *up*; the raw prices stay
+        positive and the no-cross repair handles it, so nothing is dropped."""
+        q = AvellanedaStoikovQuoter(StrategyConfig(name="avellaneda_stoikov",
+                                                   gamma=1e-4, tick_size=None))
+        quote = q.compute(self._state(inventory=-0.154))
+        # The repaired bid steps back from the touch (81,307) and is then
+        # rounded on the raw bid's grid. The raw bid is ~139,800, a decade
+        # above the touch, where the tick is 10, so it lands on 81,300: on the
+        # venue grid, below the touch, a few ticks conservative. Kept as-is so
+        # the reorder stays identical to the code the earlier sweep ran on.
+        assert quote.bid_price == pytest.approx(81_300.0)
+        assert is_on_tick_grid(quote.bid_price, 1.0)
+        assert quote.bid_price < 81_308.0
+        assert quote.ask_price is not None and quote.ask_price > 81_308.0
+        assert q.n_sides_suppressed == 0
+
+    @pytest.mark.parametrize("name", ["symmetric", "avellaneda_stoikov", "glft"])
+    def test_extreme_sigma_never_emits_a_bad_price(self, name):
+        quoters = {"symmetric": SymmetricQuoter,
+                   "avellaneda_stoikov": AvellanedaStoikovQuoter,
+                   "glft": GLFTQuoter}
+        for gamma in (1e-4, 1e-3, 1e-2):
+            q = quoters[name](StrategyConfig(name=name, gamma=gamma,
+                                             q_max=10.0, tick_size=None))
+            for sigma in (8.0, 500.0, 12_301.59, 1e6):
+                for inv in (-10.0, -3.0, -0.154, 0.0, 0.154, 3.0, 10.0):
+                    quote = q.compute(self._state(sigma=sigma, inventory=inv))
+                    for px in (quote.bid_price, quote.ask_price):
+                        if px is None:
+                            continue
+                        assert np.isfinite(px) and px > 0.0
+                        assert is_on_tick_grid(px, bitfinex_tick_size(px))
+                    if quote.bid_price is not None:
+                        assert quote.bid_price < 81_308.0     # never crosses
+                    if quote.ask_price is not None:
+                        assert quote.ask_price > 81_290.0
+
+    def test_reorder_is_identical_on_ordinary_inputs(self):
+        """The fix moves the no-cross repair ahead of rounding. For every
+        finite positive raw price that must give exactly what the old
+        round-then-repair order gave, or the earlier sweep results would no
+        longer be comparable. The old algorithm is reproduced here verbatim
+        as the reference."""
+        def old(raw_bid, raw_ask, bb, ba):
+            bt, at = bitfinex_tick_size(raw_bid), bitfinex_tick_size(raw_ask)
+            b = round_to_tick(raw_bid, bt, "down")
+            a = round_to_tick(raw_ask, at, "up")
+            if b >= ba:
+                b = round_to_tick(ba - bitfinex_tick_size(ba), bt, "down")
+            if a <= bb:
+                a = round_to_tick(bb + bitfinex_tick_size(bb), at, "up")
+            return b, a
+
+        q = SymmetricQuoter(StrategyConfig(name="symmetric", tick_size=None,
+                                           min_half_spread_bps=0.0,
+                                           max_half_spread_bps=1e6))
+        rng = np.random.default_rng(11)
+        n = 0
+        for _ in range(4000):
+            mid = float(rng.choice([rng.uniform(9_000, 11_000),     # decade edge
+                                    rng.uniform(76_000, 84_000)]))
+            half_mkt = float(rng.uniform(0.5, 30.0))
+            bb = round_to_tick(mid - half_mkt, bitfinex_tick_size(mid - half_mkt), "down")
+            ba = round_to_tick(mid + half_mkt, bitfinex_tick_size(mid + half_mkt), "up")
+            if bb >= ba:
+                continue
+            # Skews from none to far through the touch on either side.
+            r = mid + float(rng.uniform(-300.0, 300.0))
+            h = float(rng.uniform(0.0, 60.0))
+            if r - h <= 0:
+                continue
+            st = MarketState(ts_seconds=1.0, mid=mid, best_bid=bb, best_ask=ba,
+                             microprice=mid, imbalance=0.0, sigma=8.0,
+                             kappa=0.1, A=0.01, inventory=0.0,
+                             time_remaining=60.0)
+            new = q._finalise(st, r, h)
+            ob, oa = old(r - h, r + h, bb, ba)
+            assert new.bid_price == pytest.approx(ob, abs=1e-9)
+            assert new.ask_price == pytest.approx(oa, abs=1e-9)
+            n += 1
+        assert n > 3000
+        assert q.n_sides_suppressed == 0

@@ -111,6 +111,11 @@ class PerformanceMetrics:
     pnl_funding: float = 0.0
     n_funding_events: int = 0
 
+    # Quote sides not posted because the raw price was non-positive -- in
+    # practice, AS skewing hard after a flash move inflates sigma. Reported
+    # because a high count would mean the result depends on that hygiene rule.
+    n_sides_suppressed: int = 0
+
     # Share of fills on price levels the strategy created rather than joined.
     # Legitimate behaviour -- stepping inside a 15 USD spread is the whole
     # point of quoting -- but those fills are the ones the replay models
@@ -202,6 +207,7 @@ def compute_metrics(
     markout_horizons_ms: tuple[int, ...] = (100, 1000, 5000, 30000),
     strategy: str = "",
     funding_stats: dict | None = None,
+    quote_stats: dict | None = None,
 ) -> PerformanceMetrics:
     """Compute the full metric set from a run's timeline and fills."""
     if timeline.empty:
@@ -399,6 +405,7 @@ def compute_metrics(
         pnl_fees=-fees,
         pnl_funding=-pnl_funding,
         n_funding_events=n_funding_events,
+        n_sides_suppressed=int((quote_stats or {}).get("n_sides_suppressed", 0)),
         duration_hours=float(duration_h),
         frac_fills_at_new_level=frac_new_level,
         strategy=strategy,

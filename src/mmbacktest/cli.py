@@ -216,6 +216,7 @@ def run_one(
         markout_horizons_ms=run_cfg.simulation.markout_horizons_ms,
         strategy=strategy_name,
         funding_stats=result.funding_stats,
+        quote_stats=result.quote_stats,
     )
     return metrics, result
 
@@ -224,6 +225,9 @@ def cmd_run(args, cfg: Config) -> int:
     events, trades, funding, provenance = load_data(
         cfg, args.synthetic, args.n_events
     )
+    if args.no_funding:
+        logger.info("--no-funding: funding excluded from this run")
+        funding = pd.DataFrame()
     intensity = calibrate_intensity(cfg, events, trades)
 
     metrics, result = run_one(
@@ -244,6 +248,9 @@ def cmd_compare(args, cfg: Config) -> int:
     events, trades, funding, provenance = load_data(
         cfg, args.synthetic, args.n_events
     )
+    if args.no_funding:
+        logger.info("--no-funding: funding excluded from this run")
+        funding = pd.DataFrame()
     intensity = calibrate_intensity(cfg, events, trades)
 
     strategies = ["symmetric", "avellaneda_stoikov", "glft"]
@@ -358,6 +365,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="override maker fee, negative for a rebate")
     p.add_argument("--no-queue-model", action="store_true",
                    help="disable queue-position fills (for the queue sensitivity study)")
+    p.add_argument("--no-funding", action="store_true",
+                   help="leave funding out even where it was backfilled, to "
+                        "reproduce results from before the deriv backfill")
     p.add_argument("--out", help="directory for metrics and timeline output")
     p.add_argument("-v", "--verbose", action="store_true")
 

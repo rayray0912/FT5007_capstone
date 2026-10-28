@@ -51,6 +51,9 @@ class BacktestResult:
     # Empty when the run had no funding schedule, which is distinguishable
     # from a run where funding netted to zero.
     funding_stats: dict = field(default_factory=dict)
+    # Quote hygiene events from the strategy, e.g. sides not quoted because
+    # the raw price was non-positive after a flash move.
+    quote_stats: dict = field(default_factory=dict)
 
     @property
     def n_fills(self) -> int:
@@ -335,6 +338,14 @@ class BacktestEngine:
                     self.position.inventory, len(self._fills),
                 )
 
+        n_supp = int(getattr(self.quoter, "n_sides_suppressed", 0))
+        if n_supp:
+            logger.warning(
+                "%s: %d quote sides suppressed for a non-positive raw price "
+                "(normally after a flash move inflates sigma)",
+                self.quoter.name, n_supp,
+            )
+
         return BacktestResult(
             timeline=pd.DataFrame(self._timeline),
             fills=self._fills,
@@ -344,6 +355,11 @@ class BacktestEngine:
             funding_stats={
                 "funding_paid": self.position.funding_paid,
                 "n_funding_events": self.position.n_funding_events,
+            },
+            quote_stats={
+                "n_sides_suppressed": int(
+                    getattr(self.quoter, "n_sides_suppressed", 0)
+                ),
             },
         )
 

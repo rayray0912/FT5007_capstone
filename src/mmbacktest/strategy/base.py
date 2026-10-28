@@ -18,6 +18,7 @@ approach.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -30,6 +31,8 @@ from ..config import (
     round_to_tick,
 )
 
+
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class MarketState:
@@ -91,6 +94,9 @@ class Quoter(ABC):
 
     def __init__(self, cfg: StrategyConfig):
         self.cfg = cfg
+        # Sides not quoted because the raw price was non-positive or
+        # non-finite. Zero in ordinary operation; see _finalise.
+        self.n_sides_suppressed = 0
 
     @abstractmethod
     def compute(self, state: MarketState) -> Quote:
@@ -144,36 +150,87 @@ class Quoter(ABC):
         raw_bid = reservation - half_spread
         raw_ask = reservation + half_spread
 
+        # Order of operations matters here, and used to be wrong.
+        #
+        # The no-cross repair runs on the *raw* prices, before any tick
+        # lookup. A reservation price pushed far from the mid -- which happens
+        # for a few minutes after a flash move, when realised sigma is
+        # legitimately enormous -- can make the raw bid negative. Bitfinex's
+        # tick is defined only for positive prices, so rounding first raised
+        # on it (epoch 68, 2026-09-20 16:31, AS at gamma=1e-4: the book had
+        # spiked from 81,200 to 153,960 and back three minutes earlier, sigma
+        # was ~12,300 USD/sqrt(s), and an inventory of 0.154 put the raw bid at
+        # -58,595). Repairing first pins the near side to the touch, which is
+        # what the strategy is asking for when it skews that hard.
+        #
+        # For every finite positive raw price this is identical to the old
+        # round-then-repair order: rounding is outward, and the touch is
+        # already on the grid, so the repair triggers on exactly the same
+        # inputs and lands on exactly the same price.
+        #
         # The tick is a function of price on this venue, not a constant, so
         # each side is snapped on its own grid. The two agree except in the
-        # rare case where a quote straddles a power of ten.
-        bid_tick = self.tick_for(raw_bid)
-        ask_tick = self.tick_for(raw_ask)
+        # rare case where a quote straddles a power of ten. Stepping back from
+        # the touch takes the tick at the touch; the result is then rounded on
+        # the raw price's grid, as the original code did. When the raw price
+        # sits a decade above the touch (a skew of ~19,000 USD at BTC 81k,
+        # reachable only after a flash move) that rounding is coarser than the
+        # touch's grid and the repaired quote lands a few ticks further out:
+        # still on the venue grid, conservative, and kept so that results stay
+        # comparable with sweeps run before this reordering. Rounding is
+        # outward (bids down, asks up): rounding inward would post a tighter
+        # quote than the model chose.
+        if np.isfinite(raw_ask) and raw_ask <= state.best_bid:
+            ask_price: float | None = state.best_bid + self.tick_for(state.best_bid)
+            ask_tick = self.tick_for(ask_price)
+            ask_price = round_to_tick(ask_price, ask_tick, "up")
+        elif np.isfinite(raw_ask) and raw_ask > 0.0:
+            ask_tick = self.tick_for(raw_ask)
+            ask_price = round_to_tick(raw_ask, ask_tick, "up")
+        else:
+            ask_price, ask_tick = None, None
 
-        # Round outward: bids down, asks up. Rounding inward would post a
-        # tighter quote than the model chose, which biases fills upward.
-        bid_price = round_to_tick(raw_bid, bid_tick, "down")
-        ask_price = round_to_tick(raw_ask, ask_tick, "up")
-
-        # Never quote through the opposite side of the book. Crossing would
-        # make us a taker, which is a different strategy entirely.
-        #
-        # Stepping back by one tick has to land on the grid the *touch* sits
-        # on, so the tick is taken at the touch price rather than at ours.
-        if bid_price >= state.best_ask:
-            bid_price = round_to_tick(
+        if np.isfinite(raw_bid) and raw_bid >= state.best_ask:
+            bid_tick = self.tick_for(raw_bid)
+            bid_price: float | None = round_to_tick(
                 state.best_ask - self.tick_for(state.best_ask), bid_tick, "down"
             )
-        if ask_price <= state.best_bid:
-            ask_price = round_to_tick(
-                state.best_bid + self.tick_for(state.best_bid), ask_tick, "up"
-            )
+        elif np.isfinite(raw_bid) and raw_bid > 0.0:
+            bid_tick = self.tick_for(raw_bid)
+            bid_price = round_to_tick(raw_bid, bid_tick, "down")
+        else:
+            bid_price, bid_tick = None, None
+
+        # Rounding can still land a tiny positive raw price on zero: the venue
+        # caps prices at 8 decimals, so anything under 1e-8 rounds to 0.0.
+        # Positivity has to be checked after rounding, not only before.
+        if bid_price is not None and bid_price <= 0.0:
+            bid_price, bid_tick = None, None
+        if ask_price is not None and ask_price <= 0.0:
+            ask_price, ask_tick = None, None
+
+        # A side with no valid price is not quoted. A non-positive bid is not a
+        # quote at any level the model meant; the alternative, clamping the
+        # reservation to a maximum skew, would also bind in ordinary
+        # conditions at the higher gammas and silently change their results.
+        # Counted, because how often this fires is itself worth reporting.
+        for side, px in (("bid", bid_price), ("ask", ask_price)):
+            if px is None:
+                self.n_sides_suppressed += 1
+                if self.n_sides_suppressed == 1:
+                    logger.warning(
+                        "%s: %s side suppressed, raw price non-positive or "
+                        "non-finite (reservation %.1f, half-spread %.1f, "
+                        "sigma %.2f, inventory %.4f)",
+                        self.name, side, reservation, half_spread,
+                        state.sigma, state.inventory,
+                    )
 
         # An off-grid quote is a silent instant-fill bug in the queue model
         # (no depth can exist at a price the venue cannot represent), so it
         # is asserted rather than assumed.
         for px, tk in ((bid_price, bid_tick), (ask_price, ask_tick)):
-            if not is_on_tick_grid(px, tk):
+            if px is not None and not is_on_tick_grid(px, tk):
                 raise AssertionError(
                     f"{self.name}: quote {px!r} is off the {tk!r} tick grid"
                 )
@@ -184,8 +241,8 @@ class Quoter(ABC):
 
         # Inventory bound. At the cap we stop adding on that side but keep
         # quoting the other, so the position can still be worked down.
-        bid_size = q if inv + q <= q_max else 0.0
-        ask_size = q if inv - q >= -q_max else 0.0
+        bid_size = q if (inv + q <= q_max and bid_price is not None) else 0.0
+        ask_size = q if (inv - q >= -q_max and ask_price is not None) else 0.0
 
         return Quote(
             bid_price=bid_price if bid_size > 0 else None,
