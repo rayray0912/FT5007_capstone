@@ -135,7 +135,8 @@ git add scripts/sweep_epochs.py scripts/aggregate_sweep.py scripts/run_sweep.sh 
 git commit -m "feat(scripts): resumable epoch sweep and cross-epoch sign tests; refresh handoff"
 ```
 
-`results/` holds about 555 runs. Check `.gitignore` before adding any of it.
+`results/` holds 558 runs in `results/sweep` plus the funding sweep in
+`results/sweep_funding`. Check `.gitignore` before adding any of it.
 Commit `summary_epochs.csv` only, not the per-epoch timelines.
 
 ---
@@ -168,8 +169,9 @@ collector is still running, so there is more data now. Re-run
 ## 4. What the sweep established (real numbers)
 
 Sweep settings: BTC, all usable epochs (epoch 0 excluded), γ ∈ {1e-4, 1e-3,
-1e-2}, zero fees, κ and A calibrated **in-sample** on each epoch. 61 epochs at
-γ=1e-4 (epoch 68 failed, see §6), 62 at the other two. Paired binomial sign
+1e-2}, zero fees, κ and A calibrated **in-sample** on each epoch. 62 epochs at
+every γ (epoch 68 at γ=1e-4 crashed originally and was re-run after the fix in
+§6 item 1; the γ=1e-4 figures below are the 62-epoch ones). Paired binomial sign
 tests across epochs. Reproduce with `python scripts/aggregate_sweep.py`.
 
 ### 4.1 Behavioural ordering vs symmetric: robust
@@ -179,7 +181,7 @@ tests across epochs. Reproduce with `python scripts/aggregate_sweep.py`.
 | spread capture, γ=1e-3 | 60/62, p=8.5e-16 | 61/62, p=2.7e-17 |
 | inventory variance (lower), γ=1e-3 | 61/62, p=2.7e-17 | 61/62, p=2.7e-17 |
 | at γ=1e-2 | 60–62/62 on every metric | 61–62/62 on every metric |
-| at γ=1e-4 | 58/61 on every metric | 58–60/61 |
+| at γ=1e-4 | 58–59/62 on every metric | 59–61/62 |
 
 What used to be a four-epoch anecdote is now a 62-epoch result.
 
@@ -201,8 +203,8 @@ AS does.
 
 ### 4.3 AS vs GLFT: the ordering flips with γ
 
-- γ=1e-4: GLFT beats AS on capture in 42 of 61 epochs (p=0.0044) and on
-  inventory variance in 44 of 61 (p=7e-4).
+- γ=1e-4: GLFT beats AS on capture in 43 of 62 epochs (p=0.0032) and on
+  inventory variance in 45 of 62 (p=5e-4).
 - γ=1e-3 and γ=1e-2: AS beats GLFT on both, in 48–60 of 62 epochs.
 
 So "AS > GLFT" is **not** a property of the models. The same γ means different
@@ -214,7 +216,7 @@ without this caveat.
 
 ### 4.4 PnL: still noise in magnitude, but a possible sign effect
 
-- `pnl_inventory_tstat`: |t| ≥ 1.96 in 3.1% of the 555 runs, which is below
+- `pnl_inventory_tstat`: |t| ≥ 1.96 in 3.0% (17) of the 558 runs, which is below
   the 5% expected under the null. Total PnL remains uninterpretable, and the
   "PnL is not the metric" argument stands.
 - **New, needs checking:** for AS and GLFT at γ ≥ 1e-3, inventory PnL is
@@ -249,19 +251,38 @@ Each item says what "done" means. Commit after each one.
 **0. Housekeeping.** Commit the scripts (see §2), add `pyarrow` and `scipy`
 to requirements, and confirm `pytest -q` passes.
 
-**1. Fix the epoch-68 crash.** AS at γ=1e-4 on epoch 68 (29.4 h) raises
-`ValueError: tick size undefined for price -58595.1` in
-`bitfinex_tick_size`. Cause: `_finalise` clamps the half-spread but not the
-reservation price. With weak inventory control, `r = s − q·γ·σ²·τ` can go
-below zero. Fix it in `strategy/base.py::_finalise`, applied identically to
-all strategies: bound |r − mid| to a configured maximum skew (in bps, added to
-`config.py` with an inline rationale), or suppress the side when the price is
-non-positive. Add a regression test that feeds an extreme inventory and σ.
-Then re-run `python scripts/sweep_epochs.py --gamma 0.0001` (it resumes and
-only runs epoch 68) and re-aggregate. Log how often the clamp fires; if it
-fires often, that is a finding.
-*Done =* 62/62 at all three γ, the test is added, and the clamp-hit count is
-reported.
+**1. Fix the epoch-68 crash.** Done (2026-10-28). The diagnosis here was
+wrong: it was not weak inventory control. At the crash AS held 0.154
+contracts. BTC-PERP flash-spiked from 81,200 to 153,960 and back in ~1.5 s at
+2026-09-20 16:28:12 -- real trades, not a book artefact -- and realised sigma
+over the 300 s window rose to ~12,300 USD/sqrt(s) against a normal ~8. With
+that sigma, q*gamma*sigma^2*tau put the raw bid at -58,595, and `_finalise`
+looked up a tick for a negative price. The volatility estimator was checked
+and is correct (incremental and exact recompute agree); it is faithfully
+measuring a jump.
+
+Fix in `strategy/base.py::_finalise`: run the no-cross repair on the raw
+prices *before* rounding, so the near side is pinned to the touch, and do not
+quote a side whose price is non-positive (checked after rounding too, since
+the 8-decimal cap rounds anything under 1e-8 to zero). A max-skew clamp was
+rejected because it would bind in ordinary conditions at gamma=1e-2 and
+change those results. For every finite positive input the reorder is
+identical to the old order; a test checks this against the old algorithm on
+>3,000 random states. Count: 113 suppressed sides on epoch 68 (AS, 1e-4);
+reported per run as `n_sides_suppressed`.
+
+That was the only flash move in the dataset: across 59 days and all three
+symbols it is the single one-minute window with a trade more than 2% from that
+minute's median. But it dominates every pooled PnL sum. On the earlier sweep
+epoch 68 is 95% of AS's pooled loss at gamma=1e-3 and 98% at 1e-2, 89% of
+GLFT's, 56% of symmetric's -- in all three strategies, including symmetric,
+which ignores sigma, because the quoters re-centre on a mid of ~148,000 and
+are filled there before it snaps back. Sign tests and medians are robust to
+it; sums and means are not. **Decide** whether epoch 68 is excluded from PnL
+magnitudes (objective criterion above), or kept and reported both ways.
+`results/sweep/.../gamma_0.0001/epoch_68` now holds the re-run (no funding,
+zero fees, to match the other 61); the failed attempt is kept as
+`run.failed_20260928.log`. The whole sweep is now 62/62 at all three gammas.
 
 **2. Walk-forward calibration.** The CLI calibrates κ and A on the same epoch
 it replays, which is in-sample. Add a mode that calibrates on the preceding

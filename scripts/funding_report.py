@@ -136,14 +136,21 @@ def legs(df: pd.DataFrame) -> None:
         wide = d.pivot_table(index="epoch", columns="strategy", values=col)
         sign(wide, label)
 
-    print("\n  pooled over all epochs:")
-    pooled = d.groupby("strategy")[["pnl_spread_capture", "pnl_inventory",
-                                    "pnl_fees", "pnl_funding", "total_pnl"]].sum()
-    pooled = pooled.reindex([s for s in STRATS if s in pooled.index])
-    pooled.index = [SHORT[s] for s in pooled.index]
-    pooled.columns = ["spread", "inventory", "rebate", "funding", "total"]
-    with pd.option_context("display.float_format", "{:+,.0f}".format):
-        print(pooled.to_string())
+    cols = ["pnl_spread_capture", "pnl_inventory", "pnl_fees", "pnl_funding",
+            "total_pnl"]
+    names = ["spread", "inventory", "rebate", "funding", "total"]
+    order = [s for s in STRATS if s in set(d["strategy"])]
+    for how, agg in (("pooled sum", "sum"), ("median per epoch", "median")):
+        t = d.groupby("strategy")[cols].agg(agg).reindex(order)
+        t.index = [SHORT[s] for s in t.index]
+        t.columns = names
+        print(f"\n  {how} over {d['epoch'].nunique()} epochs:")
+        with pd.option_context("display.float_format", "{:+,.0f}".format):
+            print(t.to_string())
+    print("\n  Sums are fragile here: a single flash move can dominate them. On"
+          "\n  BTC epoch 68 (2026-09-20, 81,200 -> 153,960 -> 81,300 in ~1.5 s) one"
+          "\n  epoch is 89-98% of the pooled AS/GLFT loss in the earlier sweep."
+          "\n  Compare against --exclude-epochs 68, and prefer the medians.")
 
 
 def main() -> int:
@@ -154,6 +161,9 @@ def main() -> int:
     ap.add_argument("--old-fee", type=float, default=0.0)
     ap.add_argument("--gamma", type=float, default=0.001)
     ap.add_argument("--symbol", default="tBTCF0_USTF0")
+    ap.add_argument("--exclude-epochs", type=int, nargs="*", default=[],
+                    help="drop these epochs (e.g. 68, the only flash move in "
+                         "the dataset) from every section")
     args = ap.parse_args()
 
     def pick(root: str, fee: float) -> pd.DataFrame:
@@ -161,14 +171,16 @@ def main() -> int:
         if df.empty:
             return df
         return df[(df["symbol"] == args.symbol)
-                  & np.isclose(df["gamma"], args.gamma)].reset_index(drop=True)
+                  & np.isclose(df["gamma"], args.gamma)
+                  & ~df["epoch"].isin(args.exclude_epochs)].reset_index(drop=True)
 
     new = pick(args.new, args.new_fee)
     if new.empty:
         print(f"no completed epochs under {args.new} at fee {args.new_fee}")
         return 1
     print(f"{args.symbol}  gamma={args.gamma:g}  "
-          f"{new['epoch'].nunique()} epochs with funding, fee {args.new_fee:+g} bp")
+          f"{new['epoch'].nunique()} epochs with funding, fee {args.new_fee:+g} bp"
+          + (f"  (excluding {args.exclude_epochs})" if args.exclude_epochs else ""))
 
     old = pick(args.old, args.old_fee)
     clean = regression_check(new, old) if not old.empty else True
