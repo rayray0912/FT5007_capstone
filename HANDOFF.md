@@ -184,6 +184,9 @@ tests across epochs. Reproduce with `python scripts/aggregate_sweep.py`.
 | at γ=1e-4 | 58–59/62 on every metric | 59–61/62 |
 
 What used to be a four-epoch anecdote is now a 62-epoch result.
+It also survives walk-forward calibration (§5 item 2): at γ=1e-3 every
+comparison above keeps its direction when κ/A are fitted only on the 24 h
+before each epoch.
 
 ### 4.2 γ is a monotone risk dial (median across epochs)
 
@@ -292,6 +295,22 @@ Re-run γ=1e-3 under it and compare with §4. The behavioural ordering should
 survive; if it doesn't, stop and tell me.
 *Done =* `--calibration {in_sample,walk_forward}` flag, default unchanged,
 and a comparison table.
+
+Done (2026-10-28). `--calibration walk_forward --calib-hours 24` fits κ/A on
+the 24 h before the replay starts, per earlier epoch (each with its own book
+rebuild and warmup), trades strictly before the replay; it raises rather than
+falling back to in-sample when coverage is under 50%. Results in
+`results/sweep_wf` (γ=1e-3, zero fees, `--no-funding`, all 62 epochs).
+Comparison: `python scripts/compare_calibration.py [--exclude-epochs 68]`.
+**The ordering survives**: no comparison flips (table in progress report §3,
+"Calibration without lookahead"); symmetric is identical across the two sweeps
+on all 62 epochs, confirming calibration is the only variable. Per-strategy
+medians move ≤4.4%, no Wilcoxon p < 0.15. κ moves a median −1.6% (IQR −19%
+to +12%), A −9% (IQR −22% to +37%). Sample-size confound: 55 epochs are
+<24 h (walk-forward has *more* data), 7 are ≥24 h; no flips in either group,
+but the long group has little power. 12 epochs failed on the first pass on
+Tailscale/stream errors, not on history, and were re-run (`log_retry*.txt`);
+use ≤2 parallel processes for walk-forward sweeps.
 
 **3. Wire session-stratified κ/A into the engine.**
 `estimate_by_session()` already returns per-session estimates; the engine uses

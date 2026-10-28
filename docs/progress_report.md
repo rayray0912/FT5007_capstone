@@ -20,7 +20,9 @@ zero crossed books.
 
 **Calibration of the two inputs the quoters need.**
 λ(δ) = A·exp(−κδ) is fitted by bucketing trade distance from the prevailing mid
-and regressing log-rate on distance, weighted by bucket count. Against a
+and regressing log-rate on distance, weighted by bucket count. By default the fit
+uses the epoch being replayed; `--calibration walk_forward` uses only the 24 h
+before it (section 3). Against a
 generating process with a known κ = 0.02 the estimator recovers it to 0.2% with
 R² > 0.999. Realised volatility is computed on a fixed time grid and recovers a
 known σ = 0.35 to within 0.3–1.3% across sampling intervals from 100 ms to 5 s.
@@ -49,7 +51,7 @@ happens at *t*.
 **Metric layer** covering absolute performance, market-making behaviour, and
 PnL attribution.
 
-**82 unit tests**, organised around invariants.
+**103 unit tests**, organised around invariants.
 
 ### Tried and did not work
 
@@ -351,6 +353,51 @@ fills against a mid near 148,000 score as enormous "captured spread" -- which is
 another reason not to read pooled spread capture over a window containing it.
 Totals on this instrument remain a statement about inventory noise, with or
 without funding.
+
+### Calibration without lookahead (walk-forward)
+
+Every run above fits κ and A on the trades of the epoch it then replays, so the
+quoters know the coming fill intensity in advance. `--calibration walk_forward`
+fits them only on the 24 h before the replay starts, rebuilding the book
+separately in each earlier epoch that window touches, and refuses to run (it
+does not fall back to in-sample) when less than half of the window is covered.
+The 62-epoch sweep at γ=1e-3 was re-run this way, with zero fees and no funding
+to match the in-sample one, so calibration is the only change. Symmetric, which
+ignores κ and A, is identical between the two sweeps on all 62 epochs on every
+metric checked -- the control that confirms nothing else moved.
+
+| γ=1e-3, 62 epochs | in-sample | walk-forward |
+|---|---|---|
+| spread capture: AS > SYM | 60/62, p=8.5e-16 | 61/62, p=2.7e-17 |
+| spread capture: GLFT > SYM | 61/62, p=2.7e-17 | 62/62, p=4.3e-19 |
+| spread capture: GLFT > AS | 10/62, p=5.7e-08 | 10/62, p=5.7e-08 |
+| inventory variance (lower): AS > SYM | 61/62, p=2.7e-17 | 62/62, p=4.3e-19 |
+| inventory variance (lower): GLFT > SYM | 61/62, p=2.7e-17 | 61/62, p=2.7e-17 |
+| inventory variance (lower): GLFT > AS | 12/62, p=1.2e-06 | 7/62, p=2.4e-10 |
+| mean abs inventory (lower): AS > SYM | 61/62, p=2.7e-17 | 62/62, p=4.3e-19 |
+| mean abs inventory (lower): GLFT > SYM | 61/62, p=2.7e-17 | 60/62, p=8.5e-16 |
+| mean abs inventory (lower): GLFT > AS | 8/62, p=1.7e-09 | 9/62, p=1.1e-08 |
+
+No comparison changes direction. Excluding epoch 68 changes no count by more
+than one. Per strategy, walk-forward moves the median of each behavioural metric
+by at most 4.4% and none of the paired changes is significant (Wilcoxon
+p ≥ 0.2 for AS and GLFT on spread capture, inventory variance, mean abs
+inventory and fill count; p ≥ 0.15 excluding epoch 68). The parameters themselves do move: walk-forward κ sits a median
+1.6% below the in-sample fit with an IQR of −19% to +12%, and A a median 9%
+below, IQR −22% to +37%. So the result is not two modes producing the same
+number; the ordering is set by γ and the inventory terms, and a ±20% error in κ
+shifts the base half-spread without reordering the strategies.
+
+The two modes differ in sample size as well as lookahead. For the 55 epochs
+shorter than 24 h, walk-forward fits on more trades than in-sample did; for the
+7 epochs of 24 h or more, fewer. The ordering holds in both groups with no
+flips, but the long group is seven epochs and only its unanimous results
+reach p < 0.05, so it confirms direction rather than adding power.
+
+This removes one objection to the behavioural findings. It does not touch the
+PnL ones, which were noise before and are noise now. Reproduce with
+`python scripts/compare_calibration.py` (add `--exclude-epochs 68` for the
+other basis); results are in `results/sweep_wf`.
 
 ### What still limits the results
 

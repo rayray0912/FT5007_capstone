@@ -16,6 +16,11 @@ Sections:
 3. What walk-forward changes, strategy by strategy (paired, median of the
    per-epoch difference).
 4. How far the walk-forward kappa and A sit from the in-sample fit.
+5. Sections 2 and 4 split by epoch length. For an epoch shorter than the 24 h
+   window, walk-forward fits on more trades than in-sample did, so the two
+   modes differ in sample size as well as in lookahead. For a longer epoch the
+   in-sample fit has more data. If the ordering holds in both groups, neither
+   lookahead nor sample size is what produces it.
 """
 
 from __future__ import annotations
@@ -149,6 +154,37 @@ def params(ip: pd.DataFrame, wp: pd.DataFrame) -> None:
             print(f"  walk-forward fits usable: {int(u.sum())}/{len(u)}")
 
 
+def by_length(ins: pd.DataFrame, wf: pd.DataFrame, ip: pd.DataFrame,
+              wp: pd.DataFrame, hours: float) -> None:
+    dur = ins.groupby("epoch")["duration_hours"].first()
+    common = sorted(set(ins["epoch"]) & set(wf["epoch"]))
+    groups = [(f"shorter than {hours:g} h (walk-forward fits on more data)",
+               [e for e in common if dur[e] < hours]),
+              (f"{hours:g} h or longer (in-sample fits on more data)",
+               [e for e in common if dur[e] >= hours])]
+    m = ip.merge(wp, on="epoch", suffixes=("_in", "_wf"))
+    print(f"\n=== 5. split by epoch length ===")
+    for label, eps in groups:
+        print(f"  {label}: {len(eps)} epochs")
+        if not eps:
+            continue
+        oi = ordering(ins[ins["epoch"].isin(eps)])
+        ow = ordering(wf[wf["epoch"].isin(eps)])
+        for metric, _ in TESTS:
+            for a, b in PAIRS:
+                wi, ni, pi = oi[(metric, a, b)]
+                ww, nw, pw = ow[(metric, a, b)]
+                flag = "" if (wi > ni / 2) == (ww > nw / 2) else "   <-- FLIPPED"
+                print(f"    {metric:<20} {SHORT[a]+' > '+SHORT[b]:<14} "
+                      f"{wi:>3}/{ni:<3} p={pi:<8.2g} {ww:>3}/{nw:<3} p={pw:<8.2g}{flag}")
+        g = m[m["epoch"].isin(eps)]
+        for k in ("kappa", "A"):
+            r = g[f"{k}_wf"] / g[f"{k}_in"] - 1
+            if len(r):
+                print(f"    {k:<5} wf/in - 1: median {r.median():+.1%}, "
+                      f"median |.| {r.abs().median():.1%}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--in-sample", default="results/sweep")
@@ -156,6 +192,8 @@ def main() -> int:
     ap.add_argument("--gamma", type=float, default=0.001)
     ap.add_argument("--symbol", default="tBTCF0_USTF0")
     ap.add_argument("--exclude-epochs", type=int, nargs="*", default=[])
+    ap.add_argument("--calib-hours", type=float, default=24.0,
+                    help="walk-forward window used by the sweep (splits section 5)")
     args = ap.parse_args()
 
     ins = pick(args.in_sample, args.gamma, args.symbol, args.exclude_epochs)
@@ -175,8 +213,10 @@ def main() -> int:
         print("\n  !! symmetric differs: something besides calibration changed")
     side_by_side(ins, wf)
     what_changes(ins, wf)
-    params(calib_params(args.in_sample, args.gamma, args.symbol),
-           calib_params(args.walk_forward, args.gamma, args.symbol))
+    ip = calib_params(args.in_sample, args.gamma, args.symbol)
+    wp = calib_params(args.walk_forward, args.gamma, args.symbol)
+    params(ip, wp)
+    by_length(ins, wf, ip, wp, args.calib_hours)
     return 0 if ok else 3
 
 
